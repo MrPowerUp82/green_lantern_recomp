@@ -29,6 +29,7 @@ set(SOURCES
     src/platform/filesystem.cpp
     src/kernel/memory.cpp
     src/kernel/kernel_stubs.cpp
+    src/kernel/guest_thread.cpp
     src/graphics/renderer.cpp
 )
 

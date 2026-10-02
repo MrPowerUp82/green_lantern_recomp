@@ -1,5 +1,7 @@
 #include "memory.h"
 #include "../recompiled/ppc_recomp_shared.h"
+#include <algorithm>
+#include <cstring>
 #include <iostream>
 #include <fstream>
 #include <vector>
