@@ -1,0 +1,27 @@
+# Build directories
+build/
+bin/
+out/
+.vs/
+*.user
+
+# CMake generated files
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+
+# Large game assets (preserve originals on disk, do not track in Git)
+game/
+!game/default.xex
+
+# Tools build artifacts
+tools/XenonRecomp/build/
+
+# Recompiled intermediate large chunks
+src/recompiled/*.cpp
+!src/recompiled/CMakeLists.txt
+
+# OS and IDE files
+.DS_Store
+Thumbs.db
+*.log

@@ -1,0 +1,13 @@
+[main]
+file_path = "game/default.xex"
+out_directory_path = "src/recompiled"
+switch_table_file_path = "tools/jump_table.toml"
+
+restgprlr_14_address = 0x82574770
+savegprlr_14_address = 0x82574720
+restfpr_14_address = 0x8257481C
+savefpr_14_address = 0x825747D0
+restvmx_14_address = 0x82575A88
+savevmx_14_address = 0x825757F0
+restvmx_64_address = 0x82575B1C
+savevmx_64_address = 0x82575884
