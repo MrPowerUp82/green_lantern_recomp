@@ -3,6 +3,9 @@
 #include "platform/filesystem.h"
 #include "kernel/memory.h"
 #include "kernel/kernel_stubs.h"
+#include "kernel/guest_thread.h"
+#include <cstdlib>
+#include <filesystem>
 #include "graphics/renderer.h"
 
 int main(int argc, char** argv) {
@@ -55,13 +58,23 @@ int main(int argc, char** argv) {
     std::cout << "\n[Main] Sistema completamente inicializado e pronto para execução.\n";
     std::cout << "[Main] Feche a janela gráfica ou pressione ESC para encerrar o teste de runtime.\n";
 
-    // Loop de apresentação básica de teste
-    int frameCount = 0;
-    while (Graphics::NativeRenderer::IsRunning() && frameCount < 60) {
+    // 8. Iniciar a thread principal do jogo (entry point 0x822FC750 = _xstart)
+    if (!Kernel::GuestThread::StartMain()) {
+        std::cerr << "[Main] Falha ao iniciar a thread principal do guest." << std::endl;
+        return 1;
+    }
+
+    // Loop de apresentação: a thread principal do host cuida da janela enquanto o guest executa
+    while (Graphics::NativeRenderer::IsRunning() && Kernel::GuestThread::IsRunning()) {
         Graphics::NativeRenderer::BeginFrame();
-        // Emissão e sincronização dos quadros
         Graphics::NativeRenderer::EndFrame();
-        frameCount++;
+    }
+
+    if (Kernel::GuestThread::IsRunning()) {
+        // Janela fechada com o guest ainda executando: nao liberar a memoria sob a thread
+        std::cout << "[Main] Encerrando com a thread do guest ativa." << std::endl;
+        Graphics::NativeRenderer::Shutdown();
+        std::_Exit(0);
     }
 
     Graphics::NativeRenderer::Shutdown();
