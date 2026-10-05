@@ -44,11 +44,11 @@ int main(int argc, char** argv) {
               << (std::filesystem::exists(mainMenuLvl) ? "ENCONTRADO (OK)" : "NÃO ENCONTRADO") 
               << std::endl;
 
-    // 7. Inicializar o Renderizador Nativo (Direct3D 12 por padrão com fallback para Vulkan)
+    // 7. Inicializar o Renderizador Nativo (Vulkan por padrão com fallback para Direct3D 12)
     Graphics::RenderConfig renderConfig;
     renderConfig.width = 1280;
     renderConfig.height = 720;
-    renderConfig.backend = Graphics::Backend::Direct3D12;
+    renderConfig.backend = Graphics::Backend::Vulkan;
 
     if (!Graphics::NativeRenderer::Initialize(renderConfig)) {
         std::cerr << "[Main] Falha ao inicializar o renderizador nativo." << std::endl;

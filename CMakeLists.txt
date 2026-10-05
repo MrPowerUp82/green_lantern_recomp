@@ -23,6 +23,20 @@ include_directories(
 # Adicionar submódulos e código recompilado
 add_subdirectory(src/recompiled)
 
+# Camada de abstração gráfica (Vulkan / D3D12)
+add_subdirectory(thirdparty/plume)
+
+# O plume usa o volk como loader do Vulkan mas não compila o volk.c
+add_library(volk STATIC thirdparty/plume/contrib/volk/volk.c)
+target_include_directories(volk PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/plume/contrib/volk
+    ${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/plume/contrib/Vulkan-Headers/include
+)
+if (WIN32)
+    target_compile_definitions(volk PRIVATE VK_USE_PLATFORM_WIN32_KHR)
+endif()
+target_link_libraries(plume PUBLIC volk)
+
 # Definição do Executável Principal
 set(SOURCES
     src/main.cpp
@@ -35,7 +49,10 @@ set(SOURCES
 
 add_executable(GreenLanternRecomp ${SOURCES})
 
-target_link_libraries(GreenLanternRecomp PRIVATE RecompiledCode)
+target_link_libraries(GreenLanternRecomp PRIVATE RecompiledCode plume)
+if (WIN32)
+    target_link_libraries(GreenLanternRecomp PRIVATE d3d12 dxgi dxguid)
+endif()
 
 # Configuração de Output
 set_target_properties(GreenLanternRecomp PROPERTIES
