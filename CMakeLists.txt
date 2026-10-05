@@ -37,24 +37,35 @@ if (WIN32)
 endif()
 target_link_libraries(plume PUBLIC volk)
 
+# Subsistemas do engine (GpuCore, Renderer)
+add_subdirectory(src)
+
 # Definição do Executável Principal
 set(SOURCES
     src/main.cpp
-    src/platform/filesystem.cpp
-    src/kernel/memory.cpp
-    src/kernel/kernel_stubs.cpp
     src/kernel/guest_thread.cpp
-    src/graphics/renderer.cpp
 )
 
 add_executable(GreenLanternRecomp ${SOURCES})
 
-target_link_libraries(GreenLanternRecomp PRIVATE RecompiledCode plume)
+target_link_libraries(GreenLanternRecomp PRIVATE GpuCore Renderer RecompiledCode plume volk)
 if (WIN32)
     target_link_libraries(GreenLanternRecomp PRIVATE d3d12 dxgi dxguid)
 endif()
 
 # Configuração de Output
 set_target_properties(GreenLanternRecomp PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+)
+
+# Alvo de Auto-teste da GPU (M1) - isolado de RecompiledCode.lib
+add_executable(gpu_selftest src/gpu/gpu_selftest.cpp)
+
+target_link_libraries(gpu_selftest PRIVATE GpuCore Renderer volk)
+if (WIN32)
+    target_link_libraries(gpu_selftest PRIVATE d3d12 dxgi dxguid)
+endif()
+
+set_target_properties(gpu_selftest PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
