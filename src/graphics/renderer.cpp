@@ -1,5 +1,6 @@
 #include "renderer.h"
 
+#include <atomic>
 #include <iostream>
 #include <vector>
 
@@ -19,7 +20,7 @@ namespace plume {
 namespace Graphics {
     RenderConfig NativeRenderer::s_config{};
     bool NativeRenderer::s_initialized = false;
-    bool NativeRenderer::s_running = false;
+    std::atomic<bool> NativeRenderer::s_running{false};
 
     namespace {
         constexpr uint32_t kBufferCount = 2;
@@ -40,10 +41,9 @@ namespace Graphics {
         };
 
         std::unique_ptr<GpuContext> s_gpu;
-        bool s_frameActive = false;
-        uint32_t s_imageIndex = 0;
-        bool s_resizePending = false;
-        bool s_minimized = false;
+        // Escritos pela thread da janela (WM_SIZE) e lidos pela thread do CP.
+        std::atomic<bool> s_resizePending{false};
+        std::atomic<bool> s_minimized{false};
 
 #if defined(_WIN32)
         HWND s_hwnd = nullptr;
@@ -51,7 +51,8 @@ namespace Graphics {
         LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             switch (msg) {
             case WM_CLOSE:
-                DestroyWindow(hwnd);
+                // Preserva a superficie ate o join do CP e a destruicao do device.
+                PostQuitMessage(0);
                 return 0;
             case WM_DESTROY:
                 PostQuitMessage(0);
@@ -213,6 +214,7 @@ namespace Graphics {
 
         const plume::RenderWindow window = s_hwnd;
 #else
+        const plume::RenderWindow window{};
         std::cerr << "[Renderer] Plataforma sem suporte a janela nativa." << std::endl;
         return false;
 #endif
@@ -255,12 +257,7 @@ namespace Graphics {
         if (!s_initialized) return;
 
         if (s_gpu) {
-            if (s_frameActive) {
-                // Frame aberto sem EndFrame: fecha a gravacao para liberar o command list.
-                s_gpu->commandList->end();
-                s_frameActive = false;
-            }
-            // Cada EndFrame espera o fence, logo a GPU ja esta ociosa aqui.
+            // Cada PresentFrame espera o fence, logo a GPU ja esta ociosa aqui.
             s_gpu.reset();
         }
 
@@ -296,9 +293,11 @@ namespace Graphics {
         return BackendToString(s_config.backend);
     }
 
-    void NativeRenderer::BeginFrame() {
-        PollEvents();
+    void NativeRenderer::NotifyResize() {
+        s_resizePending = true;
+    }
 
+    void NativeRenderer::PresentFrame() {
         if (!s_initialized || !s_running || !s_gpu || s_minimized) {
             return;
         }
@@ -306,13 +305,15 @@ namespace Graphics {
         GpuContext& gpu = *s_gpu;
 
         if (s_resizePending || gpu.swapChain->needsResize()) {
-            s_resizePending = false;
+            s_resizePending.exchange(false);
             if (!ResizeSwapChain() || gpu.swapChain->isEmpty()) {
+                s_resizePending = true;
                 return;
             }
         }
 
-        if (!gpu.swapChain->acquireTexture(gpu.acquireSemaphore.get(), &s_imageIndex)) {
+        uint32_t imageIndex = 0;
+        if (!gpu.swapChain->acquireTexture(gpu.acquireSemaphore.get(), &imageIndex)) {
             // Swapchain desatualizada (VK_ERROR_OUT_OF_DATE_KHR): recria no proximo frame.
             s_resizePending = true;
             return;
@@ -320,10 +321,10 @@ namespace Graphics {
 
         gpu.commandList->begin();
 
-        plume::RenderTexture* target = gpu.swapChain->getTexture(s_imageIndex);
+        plume::RenderTexture* target = gpu.swapChain->getTexture(imageIndex);
         gpu.commandList->barriers(plume::RenderBarrierStage::GRAPHICS,
                                   plume::RenderTextureBarrier(target, plume::RenderTextureLayout::COLOR_WRITE));
-        gpu.commandList->setFramebuffer(gpu.framebuffers[s_imageIndex].get());
+        gpu.commandList->setFramebuffer(gpu.framebuffers[imageIndex].get());
 
         const uint32_t width = gpu.swapChain->getWidth();
         const uint32_t height = gpu.swapChain->getHeight();
@@ -333,32 +334,29 @@ namespace Graphics {
         const float* c = s_config.clearColor;
         gpu.commandList->clearColor(0, plume::RenderColor(c[0], c[1], c[2], c[3]));
 
-        s_frameActive = true;
-    }
-
-    void NativeRenderer::EndFrame() {
-        if (!s_frameActive) {
-            return;
-        }
-        s_frameActive = false;
-
-        GpuContext& gpu = *s_gpu;
-
-        plume::RenderTexture* target = gpu.swapChain->getTexture(s_imageIndex);
         gpu.commandList->barriers(plume::RenderBarrierStage::NONE,
                                   plume::RenderTextureBarrier(target, plume::RenderTextureLayout::PRESENT));
         gpu.commandList->end();
 
         const plume::RenderCommandList* commandList = gpu.commandList.get();
         plume::RenderCommandSemaphore* waitSemaphore = gpu.acquireSemaphore.get();
-        plume::RenderCommandSemaphore* signalSemaphore = gpu.releaseSemaphores[s_imageIndex].get();
+        plume::RenderCommandSemaphore* signalSemaphore = gpu.releaseSemaphores[imageIndex].get();
 
         gpu.queue->executeCommandLists(&commandList, 1, &waitSemaphore, 1, &signalSemaphore, 1, gpu.fence.get());
 
         // Apresentacao da swapchain (vkQueuePresentKHR no backend Vulkan).
-        if (!gpu.swapChain->present(s_imageIndex, &signalSemaphore, 1)) {
+        if (!gpu.swapChain->present(imageIndex, &signalSemaphore, 1)) {
             s_resizePending = true;
         }
         gpu.queue->waitForCommandFence(gpu.fence.get());
+    }
+
+    void RendererBackend::Swap(uint32_t, uint32_t, uint32_t) {
+        // O frontbuffer so passa a importar quando o renderer desenhar o jogo (sub-projeto 5).
+        NativeRenderer::PresentFrame();
+    }
+
+    void RendererBackend::OnResize(uint32_t, uint32_t) {
+        NativeRenderer::NotifyResize();
     }
 }

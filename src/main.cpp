@@ -4,11 +4,22 @@
 #include "kernel/memory.h"
 #include "kernel/kernel_stubs.h"
 #include "kernel/guest_thread.h"
+#include "kernel/guest_call.h"
+#include <chrono>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
+#include <thread>
 #include "graphics/renderer.h"
+#include "gpu/gpu_system.h"
 
 int main(int argc, char** argv) {
+    // --no-gpu-interrupts: nao dispara o callback guest de vblank/INTERRUPT da GPU.
+    bool gpuInterrupts = true;
+    for (int i = 1; i < argc; i++) {
+        if (std::strcmp(argv[i], "--no-gpu-interrupts") == 0) gpuInterrupts = false;
+    }
+
     std::cout << "====================================================\n";
     std::cout << " Green Lantern: Rise of the Manhunters - PC Recomp \n";
     std::cout << " Native Recompilation Engine (Vulkan / Direct3D 12)  \n";
@@ -55,28 +66,49 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    std::cout << "\n[Main] Sistema completamente inicializado e pronto para execução.\n";
-    std::cout << "[Main] Feche a janela gráfica ou pressione ESC para encerrar o teste de runtime.\n";
+    // 8. GPU emulada: o command processor consome o ring PM4 do jogo e chama o renderer a cada swap.
+    //    Os imports Vd* (src/kernel/vd_exports.cpp) acessam este estado via GpuSystem::Get().
+    static Graphics::RendererBackend rendererBackend;
+    auto allocateGuest = [](uint32_t size) { return Kernel::MemoryManager::AllocateVirtual(size); };
 
-    // 8. Iniciar a thread principal do jogo (entry point 0x822FC750 = _xstart)
-    if (!Kernel::GuestThread::StartMain()) {
-        std::cerr << "[Main] Falha ao iniciar a thread principal do guest." << std::endl;
+    Gpu::GpuSystemConfig gpuConfig;
+    gpuConfig.base = Kernel::MemoryManager::GetBase();
+    gpuConfig.backend = &rendererBackend;
+    gpuConfig.allocate = allocateGuest;
+    gpuConfig.caller = Kernel::CreateGuestCaller(gpuConfig.base, allocateGuest);
+    gpuConfig.enableInterrupts = gpuInterrupts;
+    if (!Gpu::GpuSystem::Get().Initialize(gpuConfig)) {
+        std::cerr << "[Main] Falha ao inicializar a GPU emulada." << std::endl;
+        Graphics::NativeRenderer::Shutdown();
         return 1;
     }
 
-    // Loop de apresentação: a thread principal do host cuida da janela enquanto o guest executa
+    std::cout << "\n[Main] Sistema completamente inicializado e pronto para execução.\n";
+    std::cout << "[Main] Feche a janela gráfica ou pressione ESC para encerrar o teste de runtime.\n";
+
+    // 9. Iniciar a thread principal do jogo (entry point 0x822FC750 = _xstart)
+    if (!Kernel::GuestThread::StartMain()) {
+        std::cerr << "[Main] Falha ao iniciar a thread principal do guest." << std::endl;
+        Gpu::GpuSystem::Get().Shutdown();
+        Graphics::NativeRenderer::Shutdown();
+        return 1;
+    }
+
+    // Loop da thread principal: so a janela. A apresentacao acontece na thread do CP (pacote XE_SWAP).
     while (Graphics::NativeRenderer::IsRunning() && Kernel::GuestThread::IsRunning()) {
-        Graphics::NativeRenderer::BeginFrame();
-        Graphics::NativeRenderer::EndFrame();
+        Graphics::NativeRenderer::PollEvents();
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
 
     if (Kernel::GuestThread::IsRunning()) {
         // Janela fechada com o guest ainda executando: nao liberar a memoria sob a thread
         std::cout << "[Main] Encerrando com a thread do guest ativa." << std::endl;
+        Gpu::GpuSystem::Get().Shutdown();
         Graphics::NativeRenderer::Shutdown();
         std::_Exit(0);
     }
 
+    Gpu::GpuSystem::Get().Shutdown();
     Graphics::NativeRenderer::Shutdown();
     Kernel::MemoryManager::Shutdown();
 

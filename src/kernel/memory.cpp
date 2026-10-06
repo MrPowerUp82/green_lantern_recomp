@@ -1,6 +1,8 @@
 #include "memory.h"
 #include "../recompiled/ppc_recomp_shared.h"
+#include "gpu/gpu_registers.h"
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <iostream>
 #include <fstream>
@@ -65,7 +67,11 @@ namespace Kernel {
             PAGE_READWRITE
         );
 
-        if (!titleRegion || !dispatchRegion || !stackRegion || !heapRegion) {
+        // Pagina MMIO: D3D publica WPTR aqui, em big-endian.
+        void* gpuMmioRegion = VirtualAlloc(s_baseMemory + Gpu::Reg::kMmioBase,
+            Gpu::Reg::kMmioSize, MEM_COMMIT, PAGE_READWRITE);
+
+        if (!titleRegion || !dispatchRegion || !stackRegion || !heapRegion || !gpuMmioRegion) {
             std::cerr << "[Memory] Falha ao comitar páginas de memória essenciais." << std::endl;
             return false;
         }
@@ -159,12 +165,10 @@ namespace Kernel {
 
     GuestAddr MemoryManager::AllocateVirtual(GuestSize size, uint32_t protection) {
         (void)protection;
-        static GuestAddr s_heapCursor = 0x40000000;
-        GuestAddr allocated = s_heapCursor;
+        static std::atomic<GuestAddr> s_heapCursor{0x40000000};
         // Alinhamento em 64KB (padrão de página do Xenon)
-        size_t alignedSize = (size + 0xFFFF) & ~0xFFFF;
-        s_heapCursor += static_cast<GuestAddr>(alignedSize);
-        return allocated;
+        size_t alignedSize = (size_t(size) + 0xFFFF) & ~size_t(0xFFFF);
+        return s_heapCursor.fetch_add(static_cast<GuestAddr>(alignedSize));
     }
 
     void MemoryManager::FreeVirtual(GuestAddr address) {
