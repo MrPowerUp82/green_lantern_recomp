@@ -1,0 +1,203 @@
+73525f2 feat(gpu): CMake setup for GpuCore, Renderer, and gpu_selftest target
+ CMakeLists.txt            | 21 ++++++++++----
+ src/CMakeLists.txt        | 31 +++++++++++++++++++++
+ src/gpu/gpu_selftest.cpp  | 70 +++++++++++++++++++++++++++++++++++++++++++++++
+ src/kernel/guest_call.cpp | 11 ++++++++
+ src/kernel/guest_call.h   |  8 ++++++
+ 5 files changed, 136 insertions(+), 5 deletions(-)
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index c29b478..b9de5dd 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -30,31 +30,42 @@ add_subdirectory(thirdparty/plume)
+ add_library(volk STATIC thirdparty/plume/contrib/volk/volk.c)
+ target_include_directories(volk PUBLIC
+     ${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/plume/contrib/volk
+     ${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/plume/contrib/Vulkan-Headers/include
+ )
+ if (WIN32)
+     target_compile_definitions(volk PRIVATE VK_USE_PLATFORM_WIN32_KHR)
+ endif()
+ target_link_libraries(plume PUBLIC volk)
+ 
++# Subsistemas do engine (GpuCore, Renderer)
++add_subdirectory(src)
++
+ # Defini├º├úo do Execut├ível Principal
+ set(SOURCES
+     src/main.cpp
+-    src/platform/filesystem.cpp
+-    src/kernel/memory.cpp
+-    src/kernel/kernel_stubs.cpp
+     src/kernel/guest_thread.cpp
+-    src/graphics/renderer.cpp
+ )
+ 
+ add_executable(GreenLanternRecomp ${SOURCES})
+ 
+-target_link_libraries(GreenLanternRecomp PRIVATE RecompiledCode plume)
++target_link_libraries(GreenLanternRecomp PRIVATE GpuCore Renderer RecompiledCode plume volk)
+ if (WIN32)
+     target_link_libraries(GreenLanternRecomp PRIVATE d3d12 dxgi dxguid)
+ endif()
+ 
+ # Configura├º├úo de Output
+ set_target_properties(GreenLanternRecomp PROPERTIES
+     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+ )
++
++# Alvo de Auto-teste da GPU (M1) - isolado de RecompiledCode.lib
++add_executable(gpu_selftest src/gpu/gpu_selftest.cpp)
++
++target_link_libraries(gpu_selftest PRIVATE GpuCore Renderer volk)
++if (WIN32)
++    target_link_libraries(gpu_selftest PRIVATE d3d12 dxgi dxguid)
++endif()
++
++set_target_properties(gpu_selftest PROPERTIES
++    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
++)
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+new file mode 100644
+index 0000000..f02a90d
+--- /dev/null
++++ b/src/CMakeLists.txt
+@@ -0,0 +1,31 @@
++# Core Engine Library (Kernel, Platform, GPU)
++add_library(GpuCore STATIC
++    platform/filesystem.cpp
++    kernel/memory.cpp
++    kernel/kernel_stubs.cpp
++    kernel/guest_call.cpp
++)
++
++target_include_directories(GpuCore PUBLIC
++    ${CMAKE_SOURCE_DIR}/include
++    ${CMAKE_SOURCE_DIR}/src
++    ${CMAKE_SOURCE_DIR}/tools/XenonRecomp/thirdparty/simde
++    ${CMAKE_SOURCE_DIR}/tools/XenonRecomp/XenonUtils
++)
++
++# Graphics Renderer Library (Plume Vulkan / Direct3D 12)
++add_library(Renderer STATIC
++    graphics/renderer.cpp
++)
++
++target_include_directories(Renderer PUBLIC
++    ${CMAKE_SOURCE_DIR}/include
++    ${CMAKE_SOURCE_DIR}/src
++    ${CMAKE_SOURCE_DIR}/thirdparty/plume/contrib/volk
++    ${CMAKE_SOURCE_DIR}/thirdparty/plume/contrib/Vulkan-Headers/include
++)
++
++target_link_libraries(Renderer PUBLIC plume volk)
++if (WIN32)
++    target_link_libraries(Renderer PUBLIC d3d12 dxgi dxguid)
++endif()
+diff --git a/src/gpu/gpu_selftest.cpp b/src/gpu/gpu_selftest.cpp
+new file mode 100644
+index 0000000..2154b3e
+--- /dev/null
++++ b/src/gpu/gpu_selftest.cpp
+@@ -0,0 +1,70 @@
++#include <iostream>
++#include <chrono>
++#include <string>
++#include "graphics/renderer.h"
++
++int main(int argc, char** argv) {
++    std::cout << "====================================================\n";
++    std::cout << " Green Lantern Recomp - GPU Self-Test (M1)          \n";
++    std::cout << "====================================================\n";
++
++    int maxFrames = -1;
++    int timeoutMs = -1;
++
++    for (int i = 1; i < argc; ++i) {
++        std::string arg = argv[i];
++        if (arg == "--frames" && i + 1 < argc) {
++            maxFrames = std::stoi(argv[++i]);
++        } else if (arg == "--timeout-ms" && i + 1 < argc) {
++            timeoutMs = std::stoi(argv[++i]);
++        }
++    }
++
++    Graphics::RenderConfig config;
++    config.width = 1280;
++    config.height = 720;
++    config.backend = Graphics::Backend::Vulkan;
++    config.allowBackendFallback = true;
++    config.clearColor[0] = 0.0f;
++    config.clearColor[1] = 0.35f;
++    config.clearColor[2] = 0.15f; // Lantern green
++    config.clearColor[3] = 1.0f;
++
++    std::cout << "[gpu_selftest] Inicializando renderizador Vulkan...\n";
++    if (!Graphics::NativeRenderer::Initialize(config)) {
++        std::cerr << "[gpu_selftest] Falha ao inicializar o renderizador nativo.\n";
++        return 1;
++    }
++
++    std::cout << "[gpu_selftest] Renderizador ativo: " << Graphics::NativeRenderer::GetBackendName() << "\n";
++    std::cout << "[gpu_selftest] Pressione ESC ou feche a janela para sair.\n";
++
++    auto startTime = std::chrono::steady_clock::now();
++    int frameCount = 0;
++
++    while (Graphics::NativeRenderer::IsRunning()) {
++        Graphics::NativeRenderer::BeginFrame();
++        Graphics::NativeRenderer::EndFrame();
++        frameCount++;
++
++        if (maxFrames > 0 && frameCount >= maxFrames) {
++            std::cout << "[gpu_selftest] Limite de frames atingido (" << maxFrames << ").\n";
++            break;
++        }
++
++        if (timeoutMs > 0) {
++            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
++                std::chrono::steady_clock::now() - startTime).count();
++            if (elapsed >= timeoutMs) {
++                std::cout << "[gpu_selftest] Timeout atingido (" << timeoutMs << " ms).\n";
++                break;
++            }
++        }
++    }
++
++    std::cout << "[gpu_selftest] Finalizando renderizador...\n";
++    Graphics::NativeRenderer::Shutdown();
++    std::cout << "[gpu_selftest] Teste concluido com sucesso (" << frameCount << " frames renderizados).\n";
++
++    return 0;
++}
+diff --git a/src/kernel/guest_call.cpp b/src/kernel/guest_call.cpp
+new file mode 100644
+index 0000000..5296142
+--- /dev/null
++++ b/src/kernel/guest_call.cpp
+@@ -0,0 +1,11 @@
++#include "guest_call.h"
++#include <iostream>
++
++namespace Kernel {
++    void GuestCall(GuestAddr functionAddr, uint64_t arg0, uint64_t arg1) {
++        (void)arg0;
++        (void)arg1;
++        if (functionAddr == 0) return;
++        std::cout << "[Kernel] GuestCall chamado para endereco 0x" << std::hex << functionAddr << std::dec << "\n";
++    }
++}
+diff --git a/src/kernel/guest_call.h b/src/kernel/guest_call.h
+new file mode 100644
+index 0000000..50dd397
+--- /dev/null
++++ b/src/kernel/guest_call.h
+@@ -0,0 +1,8 @@
++#pragma once
++
++#include "types.h"
++
++namespace Kernel {
++    // Invoca um callback ou fun├º├úo do guest (Xenon) a partir do host.
++    void GuestCall(GuestAddr functionAddr, uint64_t arg0 = 0, uint64_t arg1 = 0);
++}
