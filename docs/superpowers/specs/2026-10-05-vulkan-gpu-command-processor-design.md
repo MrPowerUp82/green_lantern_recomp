@@ -1,7 +1,7 @@
 # Renderer nativo Vulkan — Sub-projeto 1: Command Processor PM4 + Present
 
 Data: 2026-10-05
-Status: design aprovado, aguardando revisão do spec escrito
+Status: design aprovado. Emendado em 2026-10-06 durante o plano de implementação (ver "Emendas" no fim).
 
 ## 1. Contexto
 
@@ -36,9 +36,9 @@ O M1 é "**PM4 + Present**":
 - Um command processor decodifica pacotes PM4 de um ring buffer, mantém o register file e atualiza o RPTR.
 - `XE_SWAP` produz um frame na swapchain Vulkan.
 - O callback de interrupção gráfica é disparado (vblank e pacote `INTERRUPT`).
-- O executável linka e executa.
+- O executável principal compila os fontes novos e tem definição para todos os 219 `__imp__*`.
 
-Critério: a suíte `gpu_tests` passa, e a verificação manual (seção 9) mostra a janela e os logs esperados.
+Critério: a suíte `gpu_tests` passa, e a verificação manual com `gpu_selftest` (seção 9) mostra a janela Vulkan apresentando os frames do ring PM4. O link e a execução do executável principal dependem de um bloqueio pré-existente fora deste spec (seção 10).
 
 Fora do escopo do M1: draws, shaders, texturas, EDRAM e resolve, áudio, kernel HLE real. Fazer o jogo real chegar a `VdInitializeRingBuffer` e `VdSwap` é desejável, mas **não bloqueia** o M1, porque depende do kernel HLE (threads, TLS, eventos).
 
@@ -52,7 +52,12 @@ Fora do escopo do M1: draws, shaders, texturas, EDRAM e resolve, áudio, kernel 
 | `src/gpu/gpu_registers.h` | Índices de registradores usados pelo M1. | nada |
 | `src/gpu/gpu_backend.h` | Interface `IGpuBackend` (`Swap`, `OnResize`) e `NullBackend` para testes. | nada |
 | `src/graphics/renderer.cpp` (existente) | Implementa `IGpuBackend` com Plume. O loop atual de `BeginFrame`/`EndFrame` na main thread é substituído por acquire, clear e present disparados por `XE_SWAP`. | Plume |
-| `src/gpu/interrupts.{h,cpp}` | Thread de vblank a 60 Hz e despacho do callback guest. | `guest_thread` |
+| `src/gpu/interrupts.{h,cpp}` | Thread de vblank a 60 Hz e despacho do callback guest, via um `GuestCaller` injetado (fake nos testes). | nada |
+| `src/kernel/guest_call.{h,cpp}` | `CreateGuestCaller`: executa uma função guest num `PPCContext` com PCR e stack próprios (usado pelo callback de interrupção). | `ppc_context.h`, `guest_thread.h` |
+| `src/gpu/gpu_system.{h,cpp}` | Estado global (`GpuSystem::Get()`) usado pelos `Vd*`: CP, dispatcher, página MMIO. | CP, interrupções |
+| `src/gpu/selftest.{h,cpp}` | `RunSelfTest`: simula o D3D (chama os `Vd*` e publica swaps no ring). Base do teste de integração e do `gpu_selftest`. | `GpuSystem`, `Vd*` |
+| `src/gpu_selftest/main.cpp` | Executável `gpu_selftest`: janela Plume + CP + `Vd*` sem o jogo e sem o código recompilado. | `GpuCore`, Plume |
+| `src/kernel/mm_exports.cpp` | `__imp__MmGetPhysicalAddress` real (identidade: este port não separa físico de virtual). | nada |
 
 `CommandProcessor` não conhece Plume. Recebe `base` e um `IGpuBackend*` no construtor, o que permite testá-lo sem GPU nem singleton.
 
@@ -60,14 +65,16 @@ Fora do escopo do M1: draws, shaders, texturas, EDRAM e resolve, áudio, kernel 
 
 - `VdInitializeRingBuffer(base, size_log2)`: guarda o ring e inicia a thread do CP.
 - `VdEnableRingBufferRPtrWriteBack`: guarda o endereço de write-back do RPTR.
-- `VdSetSystemCommandBufferGpuIdentifierAddress`: guarda o endereço onde o CP publica o fence lido pelo jogo.
+- `VdSetSystemCommandBufferGpuIdentifierAddress`: guarda o endereço, sem uso no M1. O Xenia o trata como no-op; os fences chegam ao jogo por `EVENT_WRITE_SHD` no stream de comandos.
 - `VdSetGraphicsInterruptCallback`: guarda o endereço do callback guest e seu argumento de usuário.
 - `VdQueryVideoMode`, `VdGetCurrentDisplayInformation`: preenchem as structs em big-endian com 1280x720.
 - `VdGetSystemCommandBuffer`: retorna um buffer de sistema pequeno, alocado uma vez.
 - `VdSwap`: monta um pacote `XE_SWAP` no command buffer recebido do jogo.
 - `VdRetrainEDRAM*`, `VdEnableDisableClockGating`, `VdShutdownEngines`, `VdInitializeEngines`, `VdPersistDisplay`, `VdSetDisplayMode`, `VdIsHSIOTrainingSucceeded`, `VdInitializeScalerCommandBuffer`, `VdQueryVideoFlags`, `VdGetCurrentDisplayGamma`, `VdCallGraphicsNotificationRoutines`: fazem só o necessário para o jogo seguir (retorno de sucesso e structs mínimas).
 
-O `MemoryManager` passa a commitar a página de registradores da GPU em `0x7FC80000` (64 KB). Os índices exatos (`CP_RB_WPTR` e os demais) são conferidos contra as tabelas de registradores do Xenia durante a implementação e fixados em `gpu_registers.h`.
+`MmGetPhysicalAddress` (chamado pelo jogo antes de `VdInitializeRingBuffer`) passa a ser a identidade, e o alocador do `MemoryManager` passa a ser atômico (guest, CP e thread de interrupção alocam concorrentemente).
+
+O `MemoryManager` passa a commitar a página de registradores da GPU em `0x7FC80000` (64 KB). Os registradores que o D3D lê dali (`0x0F00`, `0x0F01`, `0x194C`, `0x1951`, `0x1961`) são inicializados com os valores do Xenia, em big-endian, porque o código recompilado lê a página com loads big-endian. Os índices exatos (`CP_RB_WPTR` e os demais) são conferidos contra as tabelas de registradores do Xenia durante a implementação e fixados em `gpu_registers.h`.
 
 ## 6. Loop do command processor
 
@@ -118,10 +125,21 @@ Casos:
 - Layout big-endian de `VdQueryVideoMode`.
 - Pacote malformado descarta até o WPTR e o CP continua vivo.
 
-Verificação manual (não faz parte do CTest): o exe linka, a janela abre, os logs mostram as chamadas `Vd*` e cada stub de import não implementado, e a janela fecha limpa com ESC.
+Verificação manual (não faz parte do CTest): `gpu_selftest.exe [frames]` abre a janela Vulkan, publica os swaps pelo ring PM4 e termina com `OK ... malformed=0`. Já executado numa Intel UHD durante o planejamento (120 swaps, 6480 pacotes, 0 malformados). Quando o código recompilado compilar, rodar o executável principal deve mostrar os logs das chamadas `Vd*` e dos imports não implementados.
 
 ## 10. Riscos
 
+- **Bloqueio pré-existente, fora deste spec:** `RecompiledCode` não compila com o MSVC `cl` desta máquina (244 usos de `__sync_bool_compare_and_swap`, 63 de `__builtin_debugtrap`, 13 de `__builtin_clzll`, e dois `goto` para rótulos que o gerador deixou em outra função, `loc_82574740` e `loc_8257479C` em `ppc_recomp.89/90.cpp`). Não há `clang-cl` instalado. Enquanto isso não for resolvido, o executável principal não linka, com ou sem a GPU. Os 219 imports e os demais símbolos do mapeamento foram conferidos estaticamente: depois que o código recompilado compilar, os únicos símbolos a resolver são os `__imp__*`, todos cobertos. Recomendo tratar isso como um spec próprio.
 - Os índices de registradores e os formatos dos pacotes `XE_SWAP` e `VdSwap` vêm da referência do Xenia e precisam ser conferidos na implementação. Nenhum deles pode ser inventado.
 - O callback de interrupção é função guest e pode exigir comportamento de kernel que hoje é stub. Se isso causar problema, o disparo fica atrás de uma flag e o M1 ainda é validado pelos testes sintéticos.
 - O ring do jogo real vem de `MmAllocatePhysicalMemoryEx`, hoje stub. No M1, os testes fornecem o ring diretamente.
+
+## Emendas (2026-10-06)
+
+Feitas ao escrever o plano, depois de conferir o código do Xenia e compilar um protótipo:
+
+- `VdSetSystemCommandBufferGpuIdentifierAddress` só guarda o endereço (o spec dizia que o CP publicava o fence nele; o Xenia não faz isso).
+- `LOAD_ALU_CONSTANT` não mascara o endereço, porque físico == virtual neste port.
+- `WAIT_REG_MEM` em registrador avalia a condição uma vez e segue (só o CP altera o register file, então esperar travaria para sempre). Em memória espera até a condição valer ou até `Stop()`.
+- Adicionados `gpu_selftest`, `GpuSystem`, `guest_call` e `mm_exports` (seção 4).
+- O critério do M1 passou a usar `gpu_selftest` em vez do executável principal, pelo bloqueio da seção 10.
