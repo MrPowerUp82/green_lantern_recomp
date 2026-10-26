@@ -4,6 +4,7 @@
 #include <string>
 #include <memory>
 #include <cstdint>
+#include <vector>
 
 #include "gpu/gpu_backend.h"
 
@@ -34,9 +35,25 @@ namespace Graphics {
         static bool Initialize(const RenderConfig& config);
         static void Shutdown();
 
-        // Adquire a imagem da swapchain, limpa, submete na fila e apresenta (vkQueuePresentKHR / Present).
+        // Liga o renderer de draws do Xenos (so no backend Vulkan: os shaders traduzidos sao SPIR-V).
+        // Chamar depois de Initialize e antes de iniciar o CP. false se o backend nao suporta draws.
+        static bool AttachGuestMemory(uint8_t* guestBase);
+        static bool HasXenosRenderer();
+
+        // Draws e resolves do Xenos (thread do CP).
+        static bool IssueDraw(const Gpu::DrawCall& draw);
+        static bool IssueCopy(const Gpu::RegisterFileView& regs);
+
+        // Adquire a imagem da swapchain, apresenta o frontbuffer resolvido em `frontbufferAddr` (ou
+        // limpa, se nao houver), submete e apresenta (vkQueuePresentKHR / Present).
         // Chamado pelo command processor a cada pacote XE_SWAP.
-        static void PresentFrame();
+        static void PresentFrame(uint32_t frontbufferAddr = 0, uint32_t frontbufferWidth = 0, uint32_t frontbufferHeight = 0);
+
+        // Copia a textura resolvida em `address` (RGBA8, ou R32F se veio de profundidade). Para o
+        // selftest, com o CP parado.
+        static bool ReadbackResolved(uint32_t address, uint32_t& width, uint32_t& height, std::vector<uint8_t>& rgba);
+        // Estatisticas do renderer de draws (texto para log).
+        static std::string XenosStatsText();
         // Marca a swapchain para recriacao no proximo PresentFrame. Thread-safe.
         static void NotifyResize();
 
@@ -59,5 +76,7 @@ namespace Graphics {
     public:
         void Swap(uint32_t frontbufferAddr, uint32_t width, uint32_t height) override;
         void OnResize(uint32_t width, uint32_t height) override;
+        bool IssueDraw(const Gpu::DrawCall& draw) override;
+        bool IssueCopy(const Gpu::RegisterFileView& regs) override;
     };
 }

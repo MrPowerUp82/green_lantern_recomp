@@ -65,6 +65,10 @@ int main(int argc, char** argv) {
         std::cerr << "[Main] Falha ao inicializar o renderizador nativo." << std::endl;
         return 1;
     }
+    // Draws, resolves e frontbuffer do jogo (exige Vulkan; no D3D12 a janela so limpa a tela).
+    if (!Graphics::NativeRenderer::AttachGuestMemory(Kernel::MemoryManager::GetBase())) {
+        std::cerr << "[Main] Renderer de draws do Xenos indisponivel: os quadros ficarao vazios." << std::endl;
+    }
 
     // 8. GPU emulada: o command processor consome o ring PM4 do jogo e chama o renderer a cada swap.
     //    Os imports Vd* (src/kernel/vd_exports.cpp) acessam este estado via GpuSystem::Get().
@@ -109,6 +113,7 @@ int main(int argc, char** argv) {
     }
 
     Gpu::GpuSystem::Get().Shutdown();
+    std::cout << "[Main] Renderer: " << Graphics::NativeRenderer::XenosStatsText() << std::endl;
     Graphics::NativeRenderer::Shutdown();
     Kernel::MemoryManager::Shutdown();
 

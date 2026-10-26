@@ -38,6 +38,10 @@ namespace Gpu {
             return addr != 0 && uint64_t(addr) + sizeBytes <= 0x100000000ull;
         }
 
+        // Valid() e a faixa inteira esta commitada no host (le sem access violation). Usado antes de
+        // ler memoria apontada por registradores da GPU (texturas, vertices, indices).
+        bool IsReadable(GuestAddr addr, uint64_t sizeBytes) const;
+
         uint32_t LoadRaw32(GuestAddr addr) const {
             return *reinterpret_cast<const volatile uint32_t*>(m_base + addr);
         }

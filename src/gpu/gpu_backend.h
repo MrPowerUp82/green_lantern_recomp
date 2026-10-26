@@ -1,5 +1,7 @@
 #pragma once
 
+#include "gpu/draw_call.h"
+
 #include <atomic>
 #include <cstdint>
 
@@ -14,6 +16,12 @@ namespace Gpu {
 
         // Chamado de qualquer thread (ex.: WM_SIZE). Deve ser thread-safe e so marcar a mudanca.
         virtual void OnResize(uint32_t width, uint32_t height) = 0;
+
+        // Chamados na thread do CP. Draw de geometria (RB_MODECONTROL != kCopy) e resolve
+        // (draw com RB_MODECONTROL == kCopy: copia do EDRAM para a memoria e clears).
+        // false = o backend nao conseguiu executar; o CP so conta e segue.
+        virtual bool IssueDraw(const DrawCall&) { return true; }
+        virtual bool IssueCopy(const RegisterFileView&) { return true; }
     };
 
     // Backend sem GPU: registra as chamadas. Usado nos testes e no selftest sem janela.
@@ -26,12 +34,25 @@ namespace Gpu {
             swapCount.fetch_add(1, std::memory_order_release);
         }
         void OnResize(uint32_t, uint32_t) override { resizeCount.fetch_add(1, std::memory_order_release); }
+        bool IssueDraw(const DrawCall& draw) override {
+            lastDraw = draw;
+            drawCount.fetch_add(1, std::memory_order_release);
+            return true;
+        }
+        bool IssueCopy(const RegisterFileView&) override {
+            copyCount.fetch_add(1, std::memory_order_release);
+            return true;
+        }
 
         std::atomic<uint32_t> swapCount{0};
         std::atomic<uint32_t> resizeCount{0};
+        std::atomic<uint32_t> drawCount{0};
+        std::atomic<uint32_t> copyCount{0};
         // Validos depois de observar swapCount > 0 (acquire).
         uint32_t lastFrontbuffer = 0;
         uint32_t lastWidth = 0;
         uint32_t lastHeight = 0;
+        // Valido depois de observar drawCount > 0; os ponteiros so valem enquanto o CP existir.
+        DrawCall lastDraw;
     };
 }

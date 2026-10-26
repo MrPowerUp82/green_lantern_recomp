@@ -6,6 +6,16 @@
 #include <vector>
 
 namespace Gpu {
+    uint64_t HashShaderUcode(xenos::ShaderType type, const uint32_t* ucode, uint32_t dwordCount) {
+        // FNV-1a 64 sobre os dwords, com o tipo misturado no inicio.
+        uint64_t h = 0xCBF29CE484222325ull ^ (uint64_t(type) + 1);
+        for (uint32_t i = 0; i < dwordCount; i++) {
+            h = (h ^ ucode[i]) * 0x100000001B3ull;
+            h ^= h >> 29;
+        }
+        return h ^ dwordCount;
+    }
+
     namespace {
         constexpr uint32_t kMaxRingSizeLog2 = 24;
 
@@ -76,6 +86,9 @@ namespace Gpu {
         s.packets = m_packets.load();
         s.swaps = m_swaps.load();
         s.draws = m_draws.load();
+        s.copies = m_copies.load();
+        s.backendFailures = m_backendFailures.load();
+        s.shaderLoads = m_shaderLoads.load();
         s.unhandled = m_unhandled.load();
         s.malformed = m_malformed.load();
         return s;
@@ -135,7 +148,7 @@ namespace Gpu {
     bool CommandProcessor::ExecuteIndirectBuffer(GuestAddr ptr, uint32_t countDwords, int depth) {
         if (depth >= kMaxIndirectDepth || (ptr & 3)) return false;
         if (countDwords == 0) return true;
-        if (!GuestMemory::Valid(ptr, uint64_t(countDwords) * 4)) return false;
+        if (!m_memory.IsReadable(ptr, uint64_t(countDwords) * 4)) return false;
 
         PacketStream stream(m_memory, ptr, countDwords, 0, countDwords);
         while (stream.Remaining() > 0 && !m_stop.load()) {
@@ -187,10 +200,38 @@ namespace Gpu {
             if (!stream.Read(&d[i])) return false;
         }
 
+        // Predicado de bins: o D3D do 360 nao usa tiling, mas respeitamos a mascara como o Xenia.
+        // Swaps predicados nunca sao validos.
+        if (header.predicate && (!(m_binSelect & m_binMask) || header.opcode == Pm4::kXeSwap)) return true;
+
         switch (header.opcode) {
         case Pm4::kNop:
         case Pm4::kMeInit:
+        case Pm4::kWaitForIdle:
+        case Pm4::kContextUpdate:
+        case Pm4::kInvalidateState:
+        case Pm4::kVizQuery:
             return true;
+
+        case Pm4::kSetBinMaskLo:
+            if (n < 1) return false;
+            m_binMask = (m_binMask & 0xFFFFFFFF00000000ull) | d[0];
+            return true;
+        case Pm4::kSetBinMaskHi:
+            if (n < 1) return false;
+            m_binMask = (m_binMask & 0xFFFFFFFFull) | (uint64_t(d[0]) << 32);
+            return true;
+        case Pm4::kSetBinSelectLo:
+            if (n < 1) return false;
+            m_binSelect = (m_binSelect & 0xFFFFFFFF00000000ull) | d[0];
+            return true;
+        case Pm4::kSetBinSelectHi:
+            if (n < 1) return false;
+            m_binSelect = (m_binSelect & 0xFFFFFFFFull) | (uint64_t(d[0]) << 32);
+            return true;
+
+        case Pm4::kImLoad: return ExecuteImLoad(d, n, false);
+        case Pm4::kImLoadImmediate: return ExecuteImLoad(d, n, true);
 
         case Pm4::kInterrupt: {
             if (n < 1) return false;
@@ -222,6 +263,7 @@ namespace Gpu {
         case Pm4::kWaitRegMem: return ExecuteWaitRegMem(d, n);
         case Pm4::kCondWrite: return ExecuteCondWrite(d, n);
         case Pm4::kEventWriteExt: return ExecuteEventWriteExt(d, n);
+        case Pm4::kEventWriteZpd: return ExecuteEventWriteZpd(d, n);
         case Pm4::kLoadAluConstant: return ExecuteLoadAluConstant(d, n);
 
         case Pm4::kRegRmw: {
@@ -281,10 +323,8 @@ namespace Gpu {
             return true;
         }
 
-        case Pm4::kDrawIndx:
-        case Pm4::kDrawIndx2:
-            m_draws.fetch_add(1);
-            return true;
+        case Pm4::kDrawIndx: return ExecuteDraw(d, n, true);
+        case Pm4::kDrawIndx2: return ExecuteDraw(d, n, false);
 
         default:
             m_unhandled.fetch_add(1);
@@ -360,6 +400,23 @@ namespace Gpu {
         return true;
     }
 
+    bool CommandProcessor::ExecuteEventWriteZpd(const uint32_t* d, uint32_t n) {
+        if (n < 1) return false;
+        WriteRegister(Reg::kVgtEventInitiator, d[0] & 0x3F);
+        // Consulta de oclusao: o D3D le a diferenca entre dois relatorios. Sem contagem real,
+        // cada evento soma amostras visiveis (como o modo "fake" do Xenia), para o jogo nunca
+        // esperar nem descartar geometria por oclusao.
+        const GuestAddr report = m_regs[xe::gpu::XE_GPU_REG_RB_SAMPLE_COUNT_ADDR] & ~GuestAddr(3);
+        if (!report || !GuestMemory::Valid(report, 32)) return true;
+        m_zpdSamples += 1000;
+        const uint32_t a = uint32_t(m_zpdSamples) - (uint32_t(m_zpdSamples) >> 1);
+        const uint32_t b = uint32_t(m_zpdSamples) >> 1;
+        // xe_gpu_depth_sample_counts: Total, ZFail, ZPass, StencilFail (pares A/B), little-endian.
+        const uint32_t values[8] = { a, b, 0, 0, a, b, 0, 0 };
+        for (uint32_t i = 0; i < 8; i++) m_memory.StoreRaw32(report + i * 4, values[i]);
+        return true;
+    }
+
     bool CommandProcessor::ExecuteLoadAluConstant(const uint32_t* d, uint32_t n) {
         if (n < 3) return false;
         // Endereco fisico == virtual neste port (MmGetPhysicalAddress e a identidade): sem mascara.
@@ -375,6 +432,97 @@ namespace Gpu {
             WriteRegister(index + i, m_memory.LoadBe32(GuestAddr(addr)));
         }
         return true;
+    }
+
+    const ShaderBlob* CommandProcessor::LoadShader(xenos::ShaderType type, const uint32_t* ucode, uint32_t dwordCount) {
+        const uint64_t hash = HashShaderUcode(type, ucode, dwordCount);
+        auto it = m_shaders.find(hash);
+        if (it == m_shaders.end()) {
+            auto blob = std::make_unique<ShaderBlob>();
+            blob->type = type;
+            blob->hash = hash;
+            blob->ucode.assign(ucode, ucode + dwordCount);
+            it = m_shaders.emplace(hash, std::move(blob)).first;
+        }
+        m_shaderLoads.fetch_add(1, std::memory_order_relaxed);
+        return it->second.get();
+    }
+
+    bool CommandProcessor::ExecuteImLoad(const uint32_t* d, uint32_t n, bool immediate) {
+        if (n < 2) return false;
+        const uint32_t typeBits = immediate ? d[0] : (d[0] & 3);
+        if (typeBits > 1) return false;
+        const xenos::ShaderType type = xenos::ShaderType(typeBits);
+        const uint32_t sizeDwords = d[1] & 0xFFFF;  // d[1] >> 16 e o offset na memoria de instrucoes (sempre 0)
+
+        const ShaderBlob* shader;
+        if (immediate) {
+            if (n - 2 < sizeDwords) return false;
+            shader = LoadShader(type, d + 2, sizeDwords);
+        } else {
+            const GuestAddr addr = d[0] & ~GuestAddr(3);
+            if (!m_memory.IsReadable(addr, uint64_t(sizeDwords) * 4)) return false;
+            std::vector<uint32_t> ucode(sizeDwords);
+            for (uint32_t i = 0; i < sizeDwords; i++) ucode[i] = m_memory.LoadBe32(addr + i * 4);
+            shader = LoadShader(type, ucode.data(), sizeDwords);
+        }
+        (type == xenos::ShaderType::kVertex ? m_activeVs : m_activePs) = shader;
+        return true;
+    }
+
+    bool CommandProcessor::ExecuteDraw(const uint32_t* d, uint32_t n, bool hasVizToken) {
+        // DRAW_INDX: [token viz] VGT_DRAW_INITIATOR [VGT_DMA_BASE VGT_DMA_SIZE].
+        // O token viz condiciona o draw a uma VIZ_QUERY anterior; tratamos o draw como visivel.
+        uint32_t i = hasVizToken ? 1 : 0;
+        if (n < i + 1) return false;
+        reg::VGT_DRAW_INITIATOR initiator;
+        initiator.value = d[i++];
+        WriteRegister(xe::gpu::XE_GPU_REG_VGT_DRAW_INITIATOR, initiator.value);
+
+        DrawCall draw;
+        draw.regs = Registers();
+        draw.vertexShader = m_activeVs;
+        draw.pixelShader = m_activePs;
+        draw.primitive = initiator.prim_type;
+        draw.indexCount = initiator.num_indices;
+
+        switch (initiator.source_select) {
+        case xenos::SourceSelect::kDMA: {
+            if (n < i + 2) return false;
+            reg::VGT_DMA_SIZE dmaSize;
+            const GuestAddr dmaBase = d[i];
+            dmaSize.value = d[i + 1];
+            WriteRegister(xe::gpu::XE_GPU_REG_VGT_DMA_BASE, dmaBase);
+            WriteRegister(xe::gpu::XE_GPU_REG_VGT_DMA_SIZE, dmaSize.value);
+            const uint32_t indexBytes = initiator.index_size == xenos::IndexFormat::kInt16 ? 2 : 4;
+            draw.indexed = true;
+            draw.indexBase = dmaBase & ~GuestAddr(indexBytes - 1);
+            draw.indexFormat = initiator.index_size;
+            draw.indexEndian = dmaSize.swap_mode;
+            draw.indexBufferBytes = dmaSize.num_words * indexBytes;
+            break;
+        }
+        case xenos::SourceSelect::kAutoIndex:
+            break;
+        default:
+            // Indices imediatos (VGT_IMMED_DATA) nao sao usados pelo D3D do 360.
+            m_unhandled.fetch_add(1);
+            LogOnce(m_loggedMisc, 0xFFFF0003u, "draw com source_select sem suporte (pulado):",
+                    uint32_t(initiator.source_select));
+            return true;
+        }
+
+        if (!m_backend) return true;
+        bool ok;
+        if (draw.regs.Get<reg::RB_MODECONTROL>().edram_mode == xenos::EdramMode::kCopy) {
+            m_copies.fetch_add(1);
+            ok = m_backend->IssueCopy(draw.regs);
+        } else {
+            m_draws.fetch_add(1);
+            ok = m_backend->IssueDraw(draw);
+        }
+        if (!ok) m_backendFailures.fetch_add(1);
+        return true;  // falha do backend nao e erro de stream: o ring segue sincronizado
     }
 
     void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {

@@ -134,13 +134,22 @@ TEST(cp_scratch_registers_mirror_to_memory_when_enabled) {
     CHECK_EQ(rig.mem.LoadBe32(scratch + 4), 9);
 }
 
-TEST(cp_draw_opcodes_are_counted_not_executed) {
+TEST(cp_draw_opcodes_are_counted) {
     CpRig rig;
-    rig.Emit({ Pm4::MakeType3(Pm4::kDrawIndx, 3), 1, 2, 3 });
-    rig.Emit({ Pm4::MakeType3(Pm4::kDrawIndx2, 2), 4, 5 });
+    // DRAW_INDX (token viz + initiator auto-index) e DRAW_INDX_2 (initiator + dword extra ignorado).
+    rig.Emit({ Pm4::MakeType3(Pm4::kDrawIndx, 2), 1, 0x00030084 });
+    rig.Emit({ Pm4::MakeType3(Pm4::kDrawIndx2, 2), 0x00030084, 5 });
     CHECK(rig.Submit());
     CHECK_EQ(rig.cp.Stats().draws, 2);
     CHECK_EQ(rig.cp.Stats().malformed, 0);
+}
+
+TEST(cp_draw_indx_dma_without_index_words_is_malformed) {
+    CpRig rig;
+    rig.Emit({ Pm4::MakeType3(Pm4::kDrawIndx, 3), 1, 2, 3 });  // kDMA sem VGT_DMA_SIZE
+    CHECK(rig.Submit());
+    CHECK_EQ(rig.cp.Stats().draws, 0);
+    CHECK_EQ(rig.cp.Stats().malformed, 1);
 }
 
 // --- Indirect buffers -------------------------------------------------------------------------

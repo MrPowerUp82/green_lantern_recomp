@@ -37,15 +37,38 @@ option(GREEN_LANTERN_BUILD_GAME "Compila o executavel com o codigo recompilado d
 option(GREEN_LANTERN_GPU_CORE_ONLY "Compila apenas GpuCore e gpu_tests" OFF)
 find_package(Threads REQUIRED)
 
+# glslang compila o GLSL gerado pelo tradutor de shaders Xenos para SPIR-V em tempo de execucao.
+if (EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/glslang/CMakeLists.txt)
+    set(ENABLE_GLSLANG_BINARIES OFF CACHE BOOL "" FORCE)
+    set(ENABLE_HLSL OFF CACHE BOOL "" FORCE)
+    set(ENABLE_OPT OFF CACHE BOOL "" FORCE)
+    set(ENABLE_SPVREMAPPER OFF CACHE BOOL "" FORCE)
+    set(GLSLANG_TESTS OFF CACHE BOOL "" FORCE)
+    set(GLSLANG_ENABLE_INSTALL OFF CACHE BOOL "" FORCE)
+    set(BUILD_EXTERNAL OFF CACHE BOOL "" FORCE)
+    add_subdirectory(thirdparty/glslang EXCLUDE_FROM_ALL)
+endif()
+
 # Núcleo isolado: só headers PPC, sem MemoryManager nem tabela de despacho.
 add_subdirectory(src)
 enable_testing()
 file(GLOB GPU_TEST_SOURCES CONFIGURE_DEPENDS tests/gpu/*.cpp)
 add_executable(gpu_tests ${GPU_TEST_SOURCES})
 target_include_directories(gpu_tests PRIVATE tests/gpu)
-target_link_libraries(gpu_tests PRIVATE GpuCore)
+target_link_libraries(gpu_tests PRIVATE GpuCore XenosDraw)
 add_test(NAME gpu_tests COMMAND gpu_tests)
 set_tests_properties(gpu_tests PROPERTIES TIMEOUT 30)
+
+# Tradutor de shaders: programas montados nos testes e, se GREEN_LANTERN_SHADER_CORPUS apontar para
+# a pasta gerada por tools/extract_shaders.py, todos os shaders do jogo (traduz + compila SPIR-V).
+if (TARGET ShaderCompiler)
+    file(GLOB GPU_SHADER_TEST_SOURCES CONFIGURE_DEPENDS tests/shader/*.cpp)
+    add_executable(gpu_shader_tests ${GPU_SHADER_TEST_SOURCES} tests/gpu/test_main.cpp)
+    target_include_directories(gpu_shader_tests PRIVATE tests/gpu tests/shader)
+    target_link_libraries(gpu_shader_tests PRIVATE XenosShader ShaderCompiler)
+    add_test(NAME gpu_shader_tests COMMAND gpu_shader_tests)
+    set_tests_properties(gpu_shader_tests PROPERTIES TIMEOUT 300)
+endif()
 if (GREEN_LANTERN_GPU_CORE_ONLY)
     return()
 endif()
@@ -70,8 +93,8 @@ endif()
 target_link_libraries(plume PUBLIC volk)
 
 # Renderer depende de Plume; GpuCore continua independente.
-add_library(Renderer STATIC src/graphics/renderer.cpp)
-target_link_libraries(Renderer PUBLIC GpuCore plume volk)
+add_library(Renderer STATIC src/graphics/renderer.cpp src/graphics/xenos_renderer.cpp)
+target_link_libraries(Renderer PUBLIC GpuCore XenosDraw XenosShader ShaderCompiler plume volk)
 if (WIN32)
     target_link_libraries(Renderer PUBLIC d3d12 dxgi dxguid)
 endif()

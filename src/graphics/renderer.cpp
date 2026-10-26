@@ -1,7 +1,10 @@
 #include "renderer.h"
 
+#include "graphics/xenos_renderer.h"
+
 #include <atomic>
 #include <iostream>
+#include <sstream>
 #include <vector>
 
 #include "plume_render_interface.h"
@@ -38,6 +41,8 @@ namespace Graphics {
             std::unique_ptr<plume::RenderCommandSemaphore> acquireSemaphore;
             std::vector<std::unique_ptr<plume::RenderCommandSemaphore>> releaseSemaphores;
             std::vector<std::unique_ptr<plume::RenderFramebuffer>> framebuffers;
+            // Ultimo membro: destruido primeiro (usa device e fila).
+            std::unique_ptr<XenosRenderer> xenos;
         };
 
         std::unique_ptr<GpuContext> s_gpu;
@@ -257,7 +262,8 @@ namespace Graphics {
         if (!s_initialized) return;
 
         if (s_gpu) {
-            // Cada PresentFrame espera o fence, logo a GPU ja esta ociosa aqui.
+            // Cada PresentFrame espera o fence; o renderer do Xenos submete o que sobrou.
+            if (s_gpu->xenos) s_gpu->xenos->Flush();
             s_gpu.reset();
         }
 
@@ -297,7 +303,49 @@ namespace Graphics {
         s_resizePending = true;
     }
 
-    void NativeRenderer::PresentFrame() {
+    bool NativeRenderer::AttachGuestMemory(uint8_t* guestBase) {
+        if (!s_initialized || !s_gpu || !guestBase) return false;
+        if (s_config.backend != Backend::Vulkan) {
+            std::cerr << "[Renderer] Draws do Xenos exigem Vulkan (shaders SPIR-V); o backend "
+                      << GetBackendName() << " so apresenta." << std::endl;
+            return false;
+        }
+        auto xenos = std::make_unique<XenosRenderer>(s_gpu->device.get(), s_gpu->queue.get(), guestBase);
+        if (!xenos->Initialize()) {
+            std::cerr << "[Renderer] Falha ao inicializar o renderer de draws do Xenos." << std::endl;
+            return false;
+        }
+        s_gpu->xenos = std::move(xenos);
+        std::cout << "[Renderer] Renderer de draws do Xenos ativo." << std::endl;
+        return true;
+    }
+
+    bool NativeRenderer::HasXenosRenderer() { return s_gpu && s_gpu->xenos; }
+
+    bool NativeRenderer::IssueDraw(const Gpu::DrawCall& draw) {
+        return s_gpu && s_gpu->xenos ? s_gpu->xenos->IssueDraw(draw) : true;
+    }
+
+    bool NativeRenderer::IssueCopy(const Gpu::RegisterFileView& regs) {
+        return s_gpu && s_gpu->xenos ? s_gpu->xenos->IssueCopy(regs) : true;
+    }
+
+    bool NativeRenderer::ReadbackResolved(uint32_t address, uint32_t& width, uint32_t& height, std::vector<uint8_t>& rgba) {
+        return s_gpu && s_gpu->xenos && s_gpu->xenos->ReadbackResolved(address, width, height, rgba);
+    }
+
+    std::string NativeRenderer::XenosStatsText() {
+        if (!s_gpu || !s_gpu->xenos) return "renderer de draws inativo";
+        const XenosRendererStats& st = s_gpu->xenos->Stats();
+        std::ostringstream out;
+        out << "draws=" << st.draws << " pulados=" << st.drawsSkipped << " resolves=" << st.resolves
+            << " clears=" << st.clears << " texturas=" << st.texturesUploaded << " shaders=" << st.shadersCompiled
+            << " falhas_shader=" << st.shaderFailures << " pipelines=" << st.pipelinesCreated
+            << " apresentacoes=" << st.presentsFromResolve;
+        return out.str();
+    }
+
+    void NativeRenderer::PresentFrame(uint32_t frontbufferAddr, uint32_t frontbufferWidth, uint32_t frontbufferHeight) {
         if (!s_initialized || !s_running || !s_gpu || s_minimized) {
             return;
         }
@@ -319,9 +367,26 @@ namespace Graphics {
             return;
         }
 
+        plume::RenderTexture* target = gpu.swapChain->getTexture(imageIndex);
+        const plume::RenderCommandList* commandList = nullptr;
+        if (gpu.xenos) {
+            // Os draws do quadro ja estao na command list do renderer do Xenos.
+            commandList = gpu.xenos->RecordPresent(target, gpu.framebuffers[imageIndex].get(), gpu.swapChain->getWidth(),
+                                                   gpu.swapChain->getHeight(), frontbufferAddr, frontbufferWidth,
+                                                   frontbufferHeight, s_config.clearColor);
+            plume::RenderCommandSemaphore* waitSemaphore = gpu.acquireSemaphore.get();
+            plume::RenderCommandSemaphore* signalSemaphore = gpu.releaseSemaphores[imageIndex].get();
+            gpu.queue->executeCommandLists(&commandList, 1, &waitSemaphore, 1, &signalSemaphore, 1, gpu.fence.get());
+            if (!gpu.swapChain->present(imageIndex, &signalSemaphore, 1)) {
+                s_resizePending = true;
+            }
+            gpu.queue->waitForCommandFence(gpu.fence.get());
+            gpu.xenos->EndFrame();
+            return;
+        }
+
         gpu.commandList->begin();
 
-        plume::RenderTexture* target = gpu.swapChain->getTexture(imageIndex);
         gpu.commandList->barriers(plume::RenderBarrierStage::GRAPHICS,
                                   plume::RenderTextureBarrier(target, plume::RenderTextureLayout::COLOR_WRITE));
         gpu.commandList->setFramebuffer(gpu.framebuffers[imageIndex].get());
@@ -338,7 +403,7 @@ namespace Graphics {
                                   plume::RenderTextureBarrier(target, plume::RenderTextureLayout::PRESENT));
         gpu.commandList->end();
 
-        const plume::RenderCommandList* commandList = gpu.commandList.get();
+        commandList = gpu.commandList.get();
         plume::RenderCommandSemaphore* waitSemaphore = gpu.acquireSemaphore.get();
         plume::RenderCommandSemaphore* signalSemaphore = gpu.releaseSemaphores[imageIndex].get();
 
@@ -351,10 +416,13 @@ namespace Graphics {
         gpu.queue->waitForCommandFence(gpu.fence.get());
     }
 
-    void RendererBackend::Swap(uint32_t, uint32_t, uint32_t) {
-        // O frontbuffer so passa a importar quando o renderer desenhar o jogo (sub-projeto 5).
-        NativeRenderer::PresentFrame();
+    void RendererBackend::Swap(uint32_t frontbufferAddr, uint32_t width, uint32_t height) {
+        NativeRenderer::PresentFrame(frontbufferAddr, width, height);
     }
+
+    bool RendererBackend::IssueDraw(const Gpu::DrawCall& draw) { return NativeRenderer::IssueDraw(draw); }
+
+    bool RendererBackend::IssueCopy(const Gpu::RegisterFileView& regs) { return NativeRenderer::IssueCopy(regs); }
 
     void RendererBackend::OnResize(uint32_t, uint32_t) {
         NativeRenderer::NotifyResize();
