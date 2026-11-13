@@ -2,9 +2,14 @@
 
 #include "gpu/shader/draw_constants.h"
 #include "gpu/shader/spirv_compiler.h"
+#include "xenia/gpu/texture_info.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
+#include <immintrin.h>
+#include <fstream>
+#include <filesystem>
 #include <iostream>
 #include <set>
 
@@ -78,6 +83,18 @@ namespace Graphics {
             default:  // k_2_10_10_10_FLOAT*, k_16_16_16_16*
                 return P::R16G16B16A16_FLOAT;
             }
+        }
+
+        // Fator de amostras por eixo do MSAA do Xenos: 2x empilha as amostras na vertical, 4x e 2x2.
+        void MsaaScale(xenos::MsaaSamples msaa, uint32_t& sx, uint32_t& sy) {
+            sx = msaa == xenos::MsaaSamples::k4X ? 2u : 1u;
+            sy = msaa == xenos::MsaaSamples::k1X ? 1u : 2u;
+        }
+
+        // Formatos de cor de 64 bits por pixel no EDRAM (tiles de 40x16 pixels).
+        bool ColorFormatIsWide(xenos::ColorRenderTargetFormat f) {
+            return f == xenos::ColorRenderTargetFormat::k_16_16_16_16 || f == xenos::ColorRenderTargetFormat::k_16_16_16_16_FLOAT ||
+                   f == xenos::ColorRenderTargetFormat::k_32_32_FLOAT;
         }
 
         bool FormatBlendable(plume::RenderFormat f) {
@@ -191,9 +208,48 @@ void main() {
         const char* kDepthCopyPixelGlsl = R"(#version 450
 layout(set = 0, binding = 0) uniform texture2D depthTexture;
 layout(set = 0, binding = 1) uniform sampler depthSampler;
+layout(push_constant) uniform Copy { vec4 params; } pc;
 layout(location = 0) out vec4 color;
 void main() {
-    color = vec4(texelFetch(sampler2D(depthTexture, depthSampler), ivec2(gl_FragCoord.xy), 0).r);
+    ivec2 p = ivec2(gl_FragCoord.xy) - ivec2(0, int(pc.params.w));
+    color = vec4(texelFetch(sampler2D(depthTexture, depthSampler), p, 0).r);
+}
+)";
+        // Resolve de cor com exp_bias (como o shader de resolve do Xenia): cor * 2^bias, limitada ao
+        // intervalo do formato de destino quando ele e normalizado.
+        const char* kColorCopyPixelGlsl = R"(#version 450
+layout(set = 0, binding = 0) uniform texture2D sourceTexture;
+layout(set = 0, binding = 1) uniform sampler sourceSampler;
+layout(push_constant) uniform Copy { vec4 params; } pc;
+layout(location = 0) out vec4 color;
+void main() {
+    ivec2 p = ivec2(gl_FragCoord.xy) - ivec2(0, int(pc.params.w));
+    vec4 c = texelFetch(sampler2D(sourceTexture, sourceSampler), p, 0) * pc.params.x;
+    color = clamp(c, vec4(pc.params.y), vec4(pc.params.z));
+}
+)";
+        // Profundidade lida como k_8_8_8_8: o texel e o dword D24S8 (depth << 8 | stencil), com R = stencil,
+        // G/B/A = bytes do depth do menos ao mais significativo. Depth em ponto flutuante usa o formato
+        // 20e4 do Xenos (conversao de Float32To20e4 do Xenia). O stencil nao e lido (0).
+        const char* kDepthEncodePixelGlsl = R"(#version 450
+layout(set = 0, binding = 0) uniform texture2D depthTexture;
+layout(set = 0, binding = 1) uniform sampler depthSampler;
+layout(push_constant) uniform Encode { vec4 params; } pc;
+layout(location = 0) out vec4 color;
+uint To20e4(float f) {
+    uint bits = floatBitsToUint(clamp(f, 0.0, 1.9999998));
+    if (bits < 0x2E800000u) {
+        uint shift = min(113u - (bits >> 23), 24u);
+        bits = (0x800000u | (bits & 0x7FFFFFu)) >> shift;
+    } else {
+        bits += 0xC8000000u;
+    }
+    return ((bits + 3u + ((bits >> 3) & 1u)) >> 3) & 0xFFFFFFu;
+}
+void main() {
+    float d = texelFetch(sampler2D(depthTexture, depthSampler), ivec2(gl_FragCoord.xy) - ivec2(0, int(pc.params.w)), 0).r;
+    uint v = pc.params.x > 0.5 ? To20e4(d) : uint(clamp(d, 0.0, 1.0) * 16777215.0 + 0.5);
+    color = vec4(0.0, float(v & 255u), float((v >> 8) & 255u), float((v >> 16) & 255u)) / 255.0;
 }
 )";
         const char* kPresentPixelGlsl = R"(#version 450
@@ -208,8 +264,8 @@ void main() {
 )";
     }
 
-    XenosRenderer::XenosRenderer(plume::RenderDevice* device, plume::RenderCommandQueue* queue, uint8_t* guestBase)
-        : m_device(device), m_queue(queue), m_memory(guestBase) {}
+    XenosRenderer::XenosRenderer(plume::RenderDevice* device, plume::RenderCommandQueue* queue, uint8_t* guestBase, bool physicalAlias)
+        : m_device(device), m_queue(queue), m_memory(guestBase, physicalAlias) {}
 
     XenosRenderer::~XenosRenderer() {
         if (m_recording) {
@@ -326,7 +382,23 @@ void main() {
         depthDesc.pixelShader = m_depthCopyPs.get();
         depthDesc.renderTargetFormat[0] = plume::RenderFormat::R32_FLOAT;
         m_depthCopyPipeline = m_device->createGraphicsPipeline(depthDesc);
-        return m_presentVs && m_presentPs && m_presentLayout && m_presentPipeline && m_presentSampler && m_depthCopyPs &&
+
+        if (!Gpu::Shader::CompileGlslToSpirv(Gpu::Shader::Stage::kPixel, kColorCopyPixelGlsl, spirv, log)) {
+            std::cerr << "[XenosRenderer] PS de resolve com exp_bias: " << log << std::endl;
+            return false;
+        }
+        m_colorCopyPs = m_device->createShader(spirv.data(), spirv.size() * 4, "main", plume::RenderShaderFormat::SPIRV);
+
+        if (!Gpu::Shader::CompileGlslToSpirv(Gpu::Shader::Stage::kPixel, kDepthEncodePixelGlsl, spirv, log)) {
+            std::cerr << "[XenosRenderer] PS de codificacao de profundidade: " << log << std::endl;
+            return false;
+        }
+        m_depthEncodePs = m_device->createShader(spirv.data(), spirv.size() * 4, "main", plume::RenderShaderFormat::SPIRV);
+        plume::RenderGraphicsPipelineDesc encodeDesc = desc;
+        encodeDesc.pixelShader = m_depthEncodePs.get();
+        encodeDesc.renderTargetFormat[0] = plume::RenderFormat::R8G8B8A8_UNORM;
+        m_depthEncodePipeline = m_device->createGraphicsPipeline(encodeDesc);
+        return m_depthEncodePipeline && m_colorCopyPs && m_presentVs && m_presentPs && m_presentLayout && m_presentPipeline && m_presentSampler && m_depthCopyPs &&
                m_depthCopyPipeline;
     }
 
@@ -541,7 +613,21 @@ void main() {
         if (it != m_pipelines.end()) return it->second.get();
         auto pipeline = m_device->createGraphicsPipeline(desc);
         plume::RenderPipeline* result = pipeline.get();
-        if (pipeline) ++m_stats.pipelinesCreated;
+        if (pipeline) {
+            ++m_stats.pipelinesCreated;
+        } else {
+            static int reported = 0;
+            if (reported++ < 6) {
+                std::fprintf(stderr, "[Renderer] falha ao criar pipeline: topologia=%d cull=%d cores=%u depth=%d ps=%d vs=%p ps=%p", int(desc.primitiveTopology),
+                             int(desc.cullMode), colorCount, int(desc.depthTargetFormat), ps ? 1 : 0,
+                             static_cast<const void*>(desc.vertexShader), static_cast<const void*>(desc.pixelShader));
+                for (uint32_t i = 0; i < colorCount; ++i) {
+                    std::fprintf(stderr, " fmt%u=%d(blend=%d mask=%02X)", i, int(desc.renderTargetFormat[i]),
+                                 int(desc.renderTargetBlend[i].blendEnabled), int(desc.renderTargetBlend[i].renderTargetWriteMask));
+                }
+                std::fprintf(stderr, "\n");
+            }
+        }
         m_pipelines.emplace(std::move(key), std::move(pipeline));
         return result;
     }
@@ -549,13 +635,16 @@ void main() {
     // ------------------------------------------------------------------ render targets
 
     XenosRenderer::RenderTarget* XenosRenderer::GetRenderTarget(uint32_t edramBase, uint32_t pitch, plume::RenderFormat format,
-                                                                bool isDepth) {
+                                                                bool isDepth, bool wide) {
         pitch = std::clamp(pitch, 16u, 8192u);
-        const auto key = std::make_tuple(edramBase, pitch, int(format), isDepth);
+        const auto key = std::make_tuple(edramBase, pitch, int(format), isDepth, wide);
         auto it = m_renderTargets.find(key);
         if (it != m_renderTargets.end()) return it->second.get();
 
         auto rt = std::make_unique<RenderTarget>();
+        rt->edramBase = edramBase;
+        rt->pitch = pitch;
+        rt->wide = wide;
         rt->format = format;
         rt->width = pitch;
         rt->height = kRenderTargetHeight;
@@ -619,9 +708,35 @@ void main() {
 
         // Resultado de um resolve no mesmo endereco: usa a copia do render target.
         if (auto resolved = m_resolved.find(desc.baseAddress); resolved != m_resolved.end()) {
+            // Profundidade amostrada como cor: usa os bytes do D24S8 em vez do valor em R32F.
+            if (resolved->second->encoded && desc.format == xenos::TextureFormat::k_8_8_8_8) {
+                bound.texture = resolved->second->encoded.get();
+                bound.view = resolved->second->encodedView.get();
+                return bound;
+            }
             bound.texture = resolved->second->texture.get();
             bound.view = resolved->second->view.get();
             return bound;
+        }
+
+        static const bool traceTex = std::getenv("GL_TRACE_TEX") != nullptr;
+        if (traceTex) {
+            static std::set<uint64_t> seen;
+            for (const auto& [addr, rt] : m_resolved) {
+                const uint64_t extent = uint64_t(rt->width) * rt->height * 8;
+                if (desc.baseAddress > addr && desc.baseAddress < addr + extent) {
+                    const uint64_t k = (uint64_t(desc.baseAddress) << 32) | addr;
+                    if (seen.insert(k).second && seen.size() < 40) {
+                        std::fprintf(stderr, "[tex] textura %08X %ux%u fmt=%u dentro do resolve %08X (%ux%u fmt=%d)\n", desc.baseAddress,
+                                     desc.width, desc.height, uint32_t(desc.format), addr, rt->width, rt->height, int(rt->format));
+                    }
+                }
+            }
+            static std::set<uint32_t> seenAddr;
+            if (seenAddr.insert(desc.baseAddress).second && seenAddr.size() < 400) {
+                std::fprintf(stderr, "[tex] uso %08X %ux%u fmt=%u tiled=%d\n", desc.baseAddress, desc.width, desc.height,
+                             uint32_t(desc.format), desc.tiled ? 1 : 0);
+            }
         }
 
         const uint64_t key = Gpu::Draw::HashBytes(&desc, sizeof(desc));
@@ -759,7 +874,7 @@ void main() {
         return result;
     }
 
-    bool XenosRenderer::CopyDepth(RenderTarget* source, ResolvedTexture& dest, const plume::RenderRect& rect) {
+    bool XenosRenderer::CopyDepth(RenderTarget* source, ResolvedTexture& dest, const plume::RenderRect& rect, int32_t destYOffset) {
         if (!source->depthView) {
             source->depthView =
                 source->texture->createTextureView(plume::RenderTextureViewDesc::Texture2D(plume::RenderFormat::D32_FLOAT_S8_UINT));
@@ -787,8 +902,99 @@ void main() {
         m_commandList->setGraphicsDescriptorSet(set.get(), 0);
         m_commandList->setViewports(plume::RenderViewport(0.0f, 0.0f, float(dest.width), float(dest.height)));
         m_commandList->setScissors(rect);
-        const float unused[4] = {};
-        m_commandList->setGraphicsPushConstants(0, unused, 0, 16);
+        const float params[4] = { 0.0f, 0.0f, 0.0f, float(destYOffset) };
+        m_commandList->setGraphicsPushConstants(0, params, 0, 16);
+        m_commandList->drawInstanced(3, 1, 0, 0);
+        m_commandList->setFramebuffer(nullptr);
+        m_commandList->barriers(plume::RenderBarrierStage::GRAPHICS,
+                                plume::RenderTextureBarrier(dest.texture.get(), plume::RenderTextureLayout::SHADER_READ));
+        m_frameSets.push_back(std::move(set));
+        return true;
+    }
+
+    bool XenosRenderer::EncodeDepth(RenderTarget* source, ResolvedTexture& dest, const plume::RenderRect& rect, bool floatDepth,
+                                    int32_t destYOffset) {
+        if (!source->depthView) return false;  // criado por CopyDepth
+        if (!dest.encoded) {
+            dest.encoded = m_device->createTexture(
+                plume::RenderTextureDesc::ColorTarget(dest.width, dest.height, plume::RenderFormat::R8G8B8A8_UNORM));
+            if (!dest.encoded) return false;
+            dest.encodedView = dest.encoded->createTextureView(plume::RenderTextureViewDesc::Texture2D(plume::RenderFormat::R8G8B8A8_UNORM));
+            const plume::RenderTexture* attachment = dest.encoded.get();
+            plume::RenderFramebufferDesc fbDesc;
+            fbDesc.colorAttachments = &attachment;
+            fbDesc.colorAttachmentsCount = 1;
+            dest.encodedFramebuffer = m_device->createFramebuffer(fbDesc);
+            if (!dest.encodedView || !dest.encodedFramebuffer) return false;
+        }
+        Transition(source, plume::RenderTextureLayout::DEPTH_READ);
+        m_commandList->barriers(plume::RenderBarrierStage::GRAPHICS,
+                                plume::RenderTextureBarrier(dest.encoded.get(), plume::RenderTextureLayout::COLOR_WRITE));
+        auto set = m_device->createDescriptorSet(*m_presentSetDesc);
+        if (!set) return false;
+        set->setTexture(0, source->texture.get(), plume::RenderTextureLayout::DEPTH_READ, source->depthView.get());
+        set->setSampler(1, m_presentSampler.get());
+        m_commandList->setFramebuffer(dest.encodedFramebuffer.get());
+        m_currentFramebuffer = nullptr;
+        m_commandList->setGraphicsPipelineLayout(m_presentLayout.get());
+        m_commandList->setPipeline(m_depthEncodePipeline.get());
+        m_commandList->setGraphicsDescriptorSet(set.get(), 0);
+        m_commandList->setViewports(plume::RenderViewport(0.0f, 0.0f, float(dest.width), float(dest.height)));
+        m_commandList->setScissors(rect);
+        const float params[4] = { floatDepth ? 1.0f : 0.0f, 0.0f, 0.0f, float(destYOffset) };
+        m_commandList->setGraphicsPushConstants(0, params, 0, 16);
+        m_commandList->drawInstanced(3, 1, 0, 0);
+        m_commandList->setFramebuffer(nullptr);
+        m_commandList->barriers(plume::RenderBarrierStage::GRAPHICS,
+                                plume::RenderTextureBarrier(dest.encoded.get(), plume::RenderTextureLayout::SHADER_READ));
+        m_frameSets.push_back(std::move(set));
+        return true;
+    }
+
+    bool XenosRenderer::CopyColorScaled(RenderTarget* source, ResolvedTexture& dest, const plume::RenderRect& rect, float scale,
+                                        float clampMin, float clampMax, int32_t destYOffset) {
+        auto& pipeline = m_colorCopyPipelines[int(dest.format)];
+        if (!pipeline) {
+            plume::RenderGraphicsPipelineDesc desc;
+            desc.pipelineLayout = m_presentLayout.get();
+            desc.vertexShader = m_presentVs.get();
+            desc.pixelShader = m_colorCopyPs.get();
+            desc.depthClipEnabled = true;
+            desc.renderTargetFormat[0] = dest.format;
+            desc.renderTargetBlend[0] = plume::RenderBlendDesc::Copy();
+            desc.renderTargetCount = 1;
+            desc.primitiveTopology = plume::RenderPrimitiveTopology::TRIANGLE_LIST;
+            pipeline = m_device->createGraphicsPipeline(desc);
+            if (!pipeline) return false;
+        }
+        if (!source->colorView) {
+            source->colorView = source->texture->createTextureView(plume::RenderTextureViewDesc::Texture2D(source->format));
+            if (!source->colorView) return false;
+        }
+        if (!dest.framebuffer) {
+            const plume::RenderTexture* attachment = dest.texture.get();
+            plume::RenderFramebufferDesc fbDesc;
+            fbDesc.colorAttachments = &attachment;
+            fbDesc.colorAttachmentsCount = 1;
+            dest.framebuffer = m_device->createFramebuffer(fbDesc);
+            if (!dest.framebuffer) return false;
+        }
+        Transition(source, plume::RenderTextureLayout::SHADER_READ);
+        m_commandList->barriers(plume::RenderBarrierStage::GRAPHICS,
+                                plume::RenderTextureBarrier(dest.texture.get(), plume::RenderTextureLayout::COLOR_WRITE));
+        auto set = m_device->createDescriptorSet(*m_presentSetDesc);
+        if (!set) return false;
+        set->setTexture(0, source->texture.get(), plume::RenderTextureLayout::SHADER_READ, source->colorView.get());
+        set->setSampler(1, m_presentSampler.get());
+        m_commandList->setFramebuffer(dest.framebuffer.get());
+        m_currentFramebuffer = nullptr;
+        m_commandList->setGraphicsPipelineLayout(m_presentLayout.get());
+        m_commandList->setPipeline(pipeline.get());
+        m_commandList->setGraphicsDescriptorSet(set.get(), 0);
+        m_commandList->setViewports(plume::RenderViewport(0.0f, 0.0f, float(dest.width), float(dest.height)));
+        m_commandList->setScissors(rect);
+        const float params[4] = { scale, clampMin, clampMax, float(destYOffset) };
+        m_commandList->setGraphicsPushConstants(0, params, 0, 16);
         m_commandList->drawInstanced(3, 1, 0, 0);
         m_commandList->setFramebuffer(nullptr);
         m_commandList->barriers(plume::RenderBarrierStage::GRAPHICS,
@@ -815,17 +1021,17 @@ void main() {
 
     bool XenosRenderer::IssueDraw(const Gpu::DrawCall& draw) {
         if (!draw.vertexShader) {
-            ++m_stats.drawsSkipped;
+            ++m_stats.drawsSkipped; ++m_stats.skipReason[0];
             return false;
         }
         const auto mode = draw.regs.Get<reg::RB_MODECONTROL>().edram_mode;
         if (mode != xenos::EdramMode::kColorDepth && mode != xenos::EdramMode::kDepthOnly) {
-            ++m_stats.drawsSkipped;
+            ++m_stats.drawsSkipped; ++m_stats.skipReason[1];
             return true;
         }
         const Gpu::Draw::HostPrimitive primitive = Gpu::Draw::ProcessPrimitive(draw, m_memory);
         if (!primitive.ok) {
-            ++m_stats.drawsSkipped;
+            ++m_stats.drawsSkipped; ++m_stats.skipReason[2];
             LogOnce("primitiva sem suporte: " + std::to_string(uint32_t(draw.primitive)));
             return true;
         }
@@ -835,14 +1041,31 @@ void main() {
                               ? GetShader(*draw.pixelShader, VertexShaderMode::kNormal)
                               : nullptr;
         if (!vs || (draw.pixelShader && mode == xenos::EdramMode::kColorDepth && !ps)) {
-            ++m_stats.drawsSkipped;
+            ++m_stats.drawsSkipped; ++m_stats.skipReason[3];
             return false;
         }
 
         Gpu::Draw::RenderState state =
             Gpu::Draw::ComputeRenderState(draw, primitive, ps && ps->translated.writesDepth);
+        // RTs no espaco de amostras do EDRAM: com MSAA o draw cobre (pitch * sx) x (altura * sy) amostras,
+        // e um RT 4x de pitch 640 ocupa as mesmas tiles que um 1x de pitch 1280 (truque de clear rapido).
+        {
+            uint32_t sx, sy;
+            MsaaScale(state.msaa, sx, sy);
+            if (sx != 1 || sy != 1) {
+                state.surfacePitch *= sx;
+                state.viewport.x *= float(sx);
+                state.viewport.width *= float(sx);
+                state.viewport.y *= float(sy);
+                state.viewport.height *= float(sy);
+                state.scissor.x *= int32_t(sx);
+                state.scissor.width *= sx;
+                state.scissor.y *= int32_t(sy);
+                state.scissor.height *= sy;
+            }
+        }
         if (state.scissor.width == 0 || state.scissor.height == 0 || state.surfacePitch == 0) {
-            ++m_stats.drawsSkipped;
+            ++m_stats.drawsSkipped; ++m_stats.skipReason[4];
             return true;
         }
 
@@ -861,17 +1084,44 @@ void main() {
                 const plume::RenderFormat format = ColorTargetFormat(state.color[i].format);
                 // Lacunas entre saidas usadas recebem um RT descartavel (mascara de escrita zero).
                 colors[i] = GetRenderTarget(used ? state.color[i].edramBase : kGapRenderTargetBase + i, state.surfacePitch,
-                                            format, false);
+                                            format, false, ColorFormatIsWide(state.color[i].format));
                 colorFormats[i] = format;
                 if (!colors[i]) return false;
             }
         }
         RenderTarget* depth = nullptr;
+        static const bool noDepth = std::getenv("GL_NO_DEPTH") != nullptr;  // depuracao: ignora o depth
+        if (noDepth) state.depth.enabled = false;
         if (state.depth.enabled) {
             depth = GetRenderTarget(state.depth.edramBase, state.surfacePitch, plume::RenderFormat::D32_FLOAT_S8_UINT, true);
         }
         if (colorCount == 0 && !depth) {
-            ++m_stats.drawsSkipped;
+            ++m_stats.drawsSkipped; ++m_stats.skipReason[5];
+            static const bool traceSkip = std::getenv("GL_TRACE_SKIP") != nullptr;
+            if (traceSkip && ps) {
+                static std::set<uint32_t> seenTex;
+                for (const Gpu::Shader::TextureBinding& binding : ps->translated.textures) {
+                    const Gpu::Draw::TextureDescription d = Gpu::Draw::DescribeTexture(draw.regs.TextureFetch(binding.fetchConstant));
+                    if (seenTex.insert(d.baseAddress).second && seenTex.size() < 60) {
+                        std::fprintf(stderr, "[skip] textura do draw descartado: %08X %ux%u fmt=%u\n", d.baseAddress, d.width, d.height,
+                                     uint32_t(d.format));
+                    }
+                }
+            }
+            static int traced = 0;
+            if (traceSkip && traced < 40) {
+                const uint32_t key = (ps ? 1u : 0u) | (draw.pixelShader ? 2u : 0u) | (uint32_t(mode) << 4) |
+                                     ((draw.regs[xe::gpu::XE_GPU_REG_RB_COLOR_MASK] & 0xFFFF) << 8);
+                static std::set<uint32_t> seen;
+                if (seen.insert(key).second) {
+                    ++traced;
+                    std::fprintf(stderr, "[skip] memexport_vs=%d memexport_ps=%d ps=%d pixelShader=%d modo=%d color_mask=%08X depthcontrol=%08X ps_escreve=%X cor0=%d\n",
+                                 vs->translated.usesMemexport ? 1 : 0, ps && ps->translated.usesMemexport ? 1 : 0,
+                                 ps ? 1 : 0, draw.pixelShader ? 1 : 0, int(mode), draw.regs[xe::gpu::XE_GPU_REG_RB_COLOR_MASK],
+                                 draw.regs[xe::gpu::XE_GPU_REG_RB_DEPTHCONTROL], ps ? ps->translated.colorTargetsWritten : 0,
+                                 state.color[0].enabled ? 1 : 0);
+                }
+            }
             return true;
         }
 
@@ -880,7 +1130,7 @@ void main() {
         plume::RenderPipeline* pipeline = GetPipeline(*vs, ps, *layout, state, primitive, colorFormats, colorCount,
                                                       depth ? plume::RenderFormat::D32_FLOAT_S8_UINT : plume::RenderFormat::UNKNOWN);
         if (!pipeline) {
-            ++m_stats.drawsSkipped;
+            ++m_stats.drawsSkipped; ++m_stats.skipReason[6];
             LogOnce("falha ao criar pipeline");
             return false;
         }
@@ -891,6 +1141,18 @@ void main() {
         auto collect = [&](const TranslatedShader& shader) {
             for (const Gpu::Shader::TextureBinding& binding : shader.textures) {
                 BoundTexture tex = GetTexture(binding.fetchConstant, draw.regs);
+                static const bool traceMissing = std::getenv("GL_TRACE_TEX") != nullptr;
+                if (traceMissing && !tex.texture) {
+                    const auto fetch = draw.regs.TextureFetch(binding.fetchConstant);
+                    const Gpu::Draw::TextureDescription d = Gpu::Draw::DescribeTexture(fetch);
+                    static std::set<uint64_t> seenMissing;
+                    const uint64_t k = (uint64_t(d.baseAddress) << 16) | (uint32_t(d.format) << 4) | uint32_t(binding.dimension);
+                    if (seenMissing.insert(k).second && seenMissing.size() < 60) {
+                        std::fprintf(stderr, "[tex] AUSENTE fetch=%u tipo=%u valida=%d base=%08X fmt=%u %ux%u dim=%d binding_dim=%d\n",
+                                     binding.fetchConstant, uint32_t(fetch.type), d.valid ? 1 : 0, d.baseAddress, uint32_t(d.format),
+                                     d.width, d.height, int(d.dimension), int(binding.dimension));
+                    }
+                }
                 const plume::RenderTexture* mainTexture = tex.texture;
                 const plume::RenderTextureView* mainView = tex.view;
                 if (binding.dimension == xenos::FetchOpDimension::k3DOrStacked) {
@@ -922,6 +1184,61 @@ void main() {
         collect(vs->translated);
         if (ps) collect(ps->translated);
 
+        // GL_SKIP_TEX=<hex,...>: descarta draws cujo PS amostra uma dessas texturas (bisseccao visual).
+        static const std::set<uint32_t> skipTex = [] {
+            std::set<uint32_t> s;
+            if (const char* e = std::getenv("GL_SKIP_TEX")) {
+                for (const char* p = e; *p;) {
+                    char* end = nullptr;
+                    s.insert(uint32_t(std::strtoul(p, &end, 16)));
+                    if (end == p) break;
+                    p = (*end == ',') ? end + 1 : end;
+                }
+            }
+            return s;
+        }();
+        if (!skipTex.empty() && ps) {
+            for (const Gpu::Shader::TextureBinding& binding : ps->translated.textures) {
+                if (skipTex.count(Gpu::Draw::DescribeTexture(draw.regs.TextureFetch(binding.fetchConstant)).baseAddress)) return true;
+            }
+        }
+
+        // GL_TRACE_DRAWS=<quadro>: lista os draws desse quadro (alvo, blend, texturas) e grava o GLSL
+        // de cada pixel shader em build/dump/ps_<ptr>.glsl.
+        static const int traceDrawsFrame = std::getenv("GL_TRACE_DRAWS") ? std::atoi(std::getenv("GL_TRACE_DRAWS")) : -1;
+        if (traceDrawsFrame >= 0 && int(m_frame) == traceDrawsFrame) {
+            static int drawIndex = 0;
+            std::fprintf(stderr, "[draw %d] zbase=%u zctl=%08X zinfo=%08X zs=%g zo=%g vte=%08X clip=%08X vp_z=%g..%g psz=%d ", drawIndex,
+                         depth ? state.depth.edramBase : 0xFFFF, draw.regs[xe::gpu::XE_GPU_REG_RB_DEPTHCONTROL],
+                         draw.regs[xe::gpu::XE_GPU_REG_RB_DEPTH_INFO], draw.regs.GetFloat(xe::gpu::XE_GPU_REG_PA_CL_VPORT_ZSCALE),
+                         draw.regs.GetFloat(xe::gpu::XE_GPU_REG_PA_CL_VPORT_ZOFFSET), draw.regs[xe::gpu::XE_GPU_REG_PA_CL_VTE_CNTL],
+                         draw.regs[xe::gpu::XE_GPU_REG_PA_CL_CLIP_CNTL], state.viewport.zMin, state.viewport.zMax,
+                         ps && ps->translated.writesDepth ? 1 : 0);
+            std::fprintf(stderr, "surf=%08X pitch=%u ", draw.regs[xe::gpu::XE_GPU_REG_RB_SURFACE_INFO], state.surfacePitch);
+            std::fprintf(stderr, "vp=%g,%g %gx%g sc=%d,%d %ux%u ", state.viewport.x, state.viewport.y, state.viewport.width,
+                         state.viewport.height, state.scissor.x, state.scissor.y, state.scissor.width, state.scissor.height);
+            std::fprintf(stderr, "[draw %d] rt0=%u fmt=%d cnt=%u depth=%d prim=%d n=%u blend0=%08X colorctl=%08X mask=%08X ps=%p",
+                         drawIndex++, colorCount ? state.color[0].edramBase : 0xFFFF, colorCount ? int(state.color[0].format) : -1,
+                         colorCount, depth ? 1 : 0, int(draw.primitive), draw.indexCount,
+                         draw.regs[xe::gpu::XE_GPU_REG_RB_BLENDCONTROL0], draw.regs[xe::gpu::XE_GPU_REG_RB_COLORCONTROL],
+                         draw.regs[xe::gpu::XE_GPU_REG_RB_COLOR_MASK], static_cast<const void*>(draw.pixelShader));
+            if (ps) {
+                for (const Gpu::Shader::TextureBinding& binding : ps->translated.textures) {
+                    const Gpu::Draw::TextureDescription d = Gpu::Draw::DescribeTexture(draw.regs.TextureFetch(binding.fetchConstant));
+                    std::fprintf(stderr, " tex[%u]=%08X %ux%u fmt=%u%s", binding.fetchConstant, d.baseAddress, d.width, d.height,
+                                 uint32_t(d.format), m_resolved.count(d.baseAddress) ? "(R)" : "");
+                }
+                static std::set<const void*> dumped;
+                if (dumped.insert(draw.pixelShader).second) {
+                    std::filesystem::create_directories("build/dump");
+                    char name[64];
+                    std::snprintf(name, sizeof(name), "build/dump/ps_%p.glsl", static_cast<const void*>(draw.pixelShader));
+                    std::ofstream(name) << ps->translated.glsl;
+                }
+            }
+            std::fprintf(stderr, "\n");
+        }
+
         // Bloco de constantes do draw.
         std::vector<uint32_t> block(DrawBlock::kSize, 0);
         for (uint32_t i = 0; i < DrawBlock::kFloatConstantCount * 4; ++i) {
@@ -948,7 +1265,7 @@ void main() {
         needed += primitive.indices.size() * 4 + 16;
         uint64_t reserveOffset = 0;
         if (!UploadReserve(size_t(needed), 16, reserveOffset)) {
-            ++m_stats.drawsSkipped;
+            ++m_stats.drawsSkipped; ++m_stats.skipReason[7];
             LogOnce("draw maior que o buffer de upload");
             return false;
         }
@@ -956,7 +1273,7 @@ void main() {
         if (m_uploadCursor == 0) m_lastBlockOffset = ~0ull;
 
         for (const VertexUpload& v : vertexUploads) {
-            const uint64_t offset = Upload(m_memory.Base() + v.address, v.bytes, 16);
+            const uint64_t offset = Upload(m_memory.Ptr(v.address), v.bytes, 16);
             block[DrawBlock::kVertexRemap + v.fc] = uint32_t(int32_t(offset / 4) - int32_t(v.address / 4));
         }
         uint64_t indexOffset = 0;
@@ -1017,7 +1334,7 @@ void main() {
         const int32_t right = std::min<int32_t>(state.scissor.x + int32_t(state.scissor.width), int32_t(sizeSource->width));
         const int32_t bottom = std::min<int32_t>(state.scissor.y + int32_t(state.scissor.height), int32_t(sizeSource->height));
         if (right <= state.scissor.x || bottom <= state.scissor.y) {
-            ++m_stats.drawsSkipped;
+            ++m_stats.drawsSkipped; ++m_stats.skipReason[8];
             return true;
         }
         m_commandList->setScissors(plume::RenderRect(state.scissor.x, state.scissor.y, right, bottom));
@@ -1050,51 +1367,132 @@ void main() {
         EnsureRecording();
         ++m_stats.resolves;
 
+        // RTs ficam no espaco de amostras (ver o draw): com MSAA o pitch e os retangulos escalam.
+        uint32_t msaaX, msaaY;
+        MsaaScale(info.msaa, msaaX, msaaY);
+        const uint32_t samplePitch = info.surfacePitch * msaaX;
         RenderTarget* source = nullptr;
         if (info.sourceIsDepth) {
-            source = GetRenderTarget(info.sourceEdramBase, info.surfacePitch, plume::RenderFormat::D32_FLOAT_S8_UINT, true);
+            source = GetRenderTarget(info.sourceEdramBase, samplePitch, plume::RenderFormat::D32_FLOAT_S8_UINT, true);
         } else {
-            source = GetRenderTarget(info.sourceEdramBase, info.surfacePitch, ColorTargetFormat(info.sourceColorFormat), false);
+            source = GetRenderTarget(info.sourceEdramBase, samplePitch, ColorTargetFormat(info.sourceColorFormat), false,
+                                     ColorFormatIsWide(info.sourceColorFormat));
         }
         if (!source) return false;
 
-        if (info.copy) {
+        if (std::getenv("GL_TRACE_RESOLVE")) {
+            static std::set<uint64_t> seenClear;
+            const uint64_t k = (uint64_t(info.sourceEdramBase) << 8) | (info.copy ? 1 : 0) | (info.clearColor ? 2 : 0) |
+                               (info.clearDepth ? 4 : 0) | (info.sourceIsDepth ? 8 : 0);
+            if (seenClear.insert(k).second && seenClear.size() < 80) {
+                std::fprintf(stderr, "[resolve-op] edram=%u pitch=%u msaa=%u fmt=%u rect=%u,%u %ux%u copy=%d clear_cor=%d clear_depth=%d depth=%d\n",
+                             info.sourceEdramBase, info.surfacePitch, uint32_t(info.msaa), uint32_t(info.sourceColorFormat), info.x,
+                             info.y, info.width, info.height, info.copy ? 1 : 0, info.clearColor ? 1 : 0, info.clearDepth ? 1 : 0,
+                             info.sourceIsDepth ? 1 : 0);
+            }
+        }
+        if (info.copy && std::getenv("GL_TRACE_RESOLVE")) {
+            static std::set<uint64_t> seenResolve;
+            const uint64_t k = (uint64_t(info.destBase) << 24) | (uint64_t(info.sourceColorFormat) << 16) |
+                               (uint64_t(info.destFormat) << 8) | uint64_t(info.destExpBias & 0xFF);
+            if (seenResolve.insert(k).second && seenResolve.size() < 80) {
+                std::fprintf(stderr, "[resolve] dest=%08X %ux%u depth=%d fonte_fmt=%u edram=%u dest_fmt=%u exp_bias=%d troca_rb=%d\n",
+                             info.destBase, info.width, info.height, info.sourceIsDepth ? 1 : 0, uint32_t(info.sourceColorFormat),
+                             info.sourceEdramBase, uint32_t(info.destFormat), info.destExpBias, info.destSwapRedBlue ? 1 : 0);
+            }
+        }
+        if (info.copy && (msaaX != 1 || msaaY != 1)) {
+            // Precisaria da media das amostras (downsample); ainda nao feito.
+            LogOnce("resolve de superficie com MSAA ignorado (sem downsample)");
+        } else if (info.copy) {
             // Copia o retangulo para uma textura do host associada ao endereco de destino. A
             // profundidade vira R32F (k_24_8 lido como float pelos shaders).
             const plume::RenderFormat format = info.sourceIsDepth ? plume::RenderFormat::R32_FLOAT : source->format;
             const uint32_t width = std::max(info.destPitch, info.x + info.width);
             const uint32_t height = std::max(std::max(info.destHeight, 1u), info.y + info.height);
-            auto& slot = m_resolved[info.destBase];
-            if (!slot || slot->format != format || slot->width != width || slot->height != height) {
-                // A anterior pode estar em comandos ja gravados: so e destruida no fim do quadro.
-                if (slot) m_retiredResolved.push_back(std::move(slot));
-                slot = std::make_unique<ResolvedTexture>();
-                slot->format = format;
-                slot->width = width;
-                slot->height = height;
-                slot->texture = info.sourceIsDepth
-                                    ? m_device->createTexture(plume::RenderTextureDesc::ColorTarget(width, height, format))
-                                    : m_device->createTexture(plume::RenderTextureDesc::Texture2D(width, height, 1, format));
-                if (!slot->texture) {
-                    m_resolved.erase(info.destBase);
-                    return false;
-                }
-                slot->view = slot->texture->createTextureView(plume::RenderTextureViewDesc::Texture2D(format));
+            const xe::gpu::FormatInfo* destInfo = xe::gpu::FormatInfo::Get(info.destFormat);
+            const uint32_t guestRowBytes = width * (destInfo ? std::max(destInfo->bits_per_pixel / 8, 1u) : 4u);
+
+            // Resolve em faixas: o jogo renderiza um alvo maior que o EDRAM em pedacos e resolve cada um
+            // em base + linhas * pitch. Se o destino cai dentro de uma textura ja resolvida (mesmo formato
+            // e pitch, deslocamento alinhado a linha), escreve nela deslocado em Y, como o Xenia faz ao
+            // copiar para a memoria do guest.
+            uint32_t destY = 0;
+            ResolvedTexture* parent = nullptr;
+            for (auto& [addr, rt] : m_resolved) {
+                if (addr >= info.destBase || !rt || rt->format != format || rt->width != width || rt->guestRowBytes != guestRowBytes) continue;
+                const uint32_t delta = info.destBase - addr;
+                if (delta % guestRowBytes) continue;
+                const uint32_t rows = delta / guestRowBytes;
+                if (rows + info.y + info.height > rt->height) continue;
+                parent = rt.get();
+                destY = rows;
+                break;
             }
+            if (parent) {
+                // Uma textura propria antiga neste endereco deixa de valer.
+                if (auto own = m_resolved.find(info.destBase); own != m_resolved.end()) {
+                    m_retiredResolved.push_back(std::move(own->second));
+                    m_resolved.erase(own);
+                }
+            }
+            ResolvedTexture* dst = parent;
+            if (!dst) {
+                auto& slot = m_resolved[info.destBase];
+                if (!slot || slot->format != format || slot->width != width || slot->height != height) {
+                    // A anterior pode estar em comandos ja gravados: so e destruida no fim do quadro.
+                    if (slot) m_retiredResolved.push_back(std::move(slot));
+                    slot = std::make_unique<ResolvedTexture>();
+                    slot->format = format;
+                    slot->width = width;
+                    slot->height = height;
+                    slot->guestRowBytes = guestRowBytes;
+                    // ColorTarget: serve tanto de destino de copia quanto de alvo dos passes de conversao.
+                    slot->texture = m_device->createTexture(plume::RenderTextureDesc::ColorTarget(width, height, format));
+                    if (!slot->texture) {
+                        m_resolved.erase(info.destBase);
+                        return false;
+                    }
+                    slot->view = slot->texture->createTextureView(plume::RenderTextureViewDesc::Texture2D(format));
+                }
+                dst = slot.get();
+            }
+            ResolvedTexture& target = *dst;
             const uint32_t copyRight = std::min(info.x + info.width, source->width);
             const uint32_t copyBottom = std::min(info.y + info.height, source->height);
+            // Retangulo no destino (deslocado destY linhas); a origem no EDRAM continua em info.x/info.y.
+            const int32_t dy = int32_t(destY);
+            const plume::RenderRect destRect(int32_t(info.x), int32_t(info.y) + dy, int32_t(copyRight), int32_t(copyBottom) + dy);
             if (info.sourceIsDepth && copyRight > info.x && copyBottom > info.y) {
-                CopyDepth(source, *slot, plume::RenderRect(int32_t(info.x), int32_t(info.y), int32_t(copyRight), int32_t(copyBottom)));
+                if (CopyDepth(source, target, destRect, dy)) {
+                    EncodeDepth(source, target, destRect, info.sourceDepthFormat == xenos::DepthRenderTargetFormat::kD24FS8, dy);
+                }
+            } else if (info.destExpBias != 0 && copyRight > info.x && copyBottom > info.y) {
+                // Formatos de destino normalizados limitam o resultado; os de ponto flutuante nao.
+                float lo = -65504.0f, hi = 65504.0f;
+                switch (info.destFormat) {
+                case xenos::TextureFormat::k_8_8_8_8:
+                case xenos::TextureFormat::k_2_10_10_10:
+                    lo = 0.0f; hi = 1.0f;
+                    break;
+                case xenos::TextureFormat::k_16_16:
+                case xenos::TextureFormat::k_16_16_16_16:
+                    lo = -1.0f; hi = 1.0f;
+                    break;
+                default:
+                    break;
+                }
+                CopyColorScaled(source, target, destRect, std::ldexp(1.0f, info.destExpBias), lo, hi, dy);
             } else if (copyRight > info.x && copyBottom > info.y) {
                 Transition(source, plume::RenderTextureLayout::COPY_SOURCE);
                 m_commandList->barriers(plume::RenderBarrierStage::COPY,
-                                        plume::RenderTextureBarrier(slot->texture.get(), plume::RenderTextureLayout::COPY_DEST));
+                                        plume::RenderTextureBarrier(target.texture.get(), plume::RenderTextureLayout::COPY_DEST));
                 const plume::RenderBox box(int32_t(info.x), int32_t(info.y), int32_t(copyRight), int32_t(copyBottom));
-                m_commandList->copyTextureRegion(plume::RenderTextureCopyLocation::Subresource(slot->texture.get()),
+                m_commandList->copyTextureRegion(plume::RenderTextureCopyLocation::Subresource(target.texture.get()),
                                                  plume::RenderTextureCopyLocation::Subresource(source->texture.get()), info.x,
-                                                 info.y, 0, &box);
+                                                 info.y + destY, 0, &box);
                 m_commandList->barriers(plume::RenderBarrierStage::GRAPHICS,
-                                        plume::RenderTextureBarrier(slot->texture.get(), plume::RenderTextureLayout::SHADER_READ));
+                                        plume::RenderTextureBarrier(target.texture.get(), plume::RenderTextureLayout::SHADER_READ));
             }
             // Uma textura do cache no mesmo endereco agora esta obsoleta.
             for (auto it = m_textures.begin(); it != m_textures.end();) {
@@ -1109,8 +1507,8 @@ void main() {
 
         // Clears depois da copia.
         if (info.width && info.height && (info.clearColor || info.clearDepth)) {
-            const plume::RenderRect rect(int32_t(info.x), int32_t(info.y), int32_t(info.x + info.width),
-                                         int32_t(info.y + info.height));
+            const plume::RenderRect rect(int32_t(info.x * msaaX), int32_t(info.y * msaaY), int32_t((info.x + info.width) * msaaX),
+                                         int32_t((info.y + info.height) * msaaY));
             if (info.clearColor && !info.sourceIsDepth) {
                 Transition(source, plume::RenderTextureLayout::COLOR_WRITE);
                 RenderTarget* targets[1] = { source };
@@ -1118,11 +1516,16 @@ void main() {
                 const auto c = Gpu::Draw::UnpackColorClear(info.sourceColorFormat, info.colorClear, info.colorClearLo);
                 m_commandList->clearColor(0, plume::RenderColor(c[0], c[1], c[2], c[3]), &rect, 1);
                 ++m_stats.clears;
+                if (info.colorClear == 0 && info.colorClearLo == 0) {
+                    PropagateZeroClear(source, rect);
+                } else {
+                    LogOnce("clear de cor com valor nao nulo: nao refletido nos RTs que compartilham o EDRAM");
+                }
             }
             if (info.clearDepth) {
                 const auto depthInfo = regs.Get<reg::RB_DEPTH_INFO>();
                 RenderTarget* depth =
-                    GetRenderTarget(depthInfo.depth_base, info.surfacePitch, plume::RenderFormat::D32_FLOAT_S8_UINT, true);
+                    GetRenderTarget(depthInfo.depth_base, samplePitch, plume::RenderFormat::D32_FLOAT_S8_UINT, true);
                 if (depth) {
                     Transition(depth, plume::RenderTextureLayout::DEPTH_WRITE);
                     BindFramebuffer(GetFramebuffer(nullptr, 0, depth));
@@ -1137,12 +1540,152 @@ void main() {
         return true;
     }
 
+    void XenosRenderer::PropagateZeroClear(const RenderTarget* source, const plume::RenderRect& rect) {
+        constexpr uint32_t kEdramTiles = 2048, kTileRows = 16;
+        auto tileWidth = [](const RenderTarget& rt) { return rt.wide ? 40u : 80u; };
+        auto tilesPerRow = [&](const RenderTarget& rt) { return (rt.pitch + tileWidth(rt) - 1) / tileWidth(rt); };
+        if (source->edramBase >= kEdramTiles) return;
+
+        // Faixas de tiles lineares (inicio, quantidade) apagadas pelo clear.
+        const uint32_t srcTw = tileWidth(*source), srcTpr = tilesPerRow(*source);
+        const uint32_t c0 = uint32_t(rect.left) / srcTw, c1 = (uint32_t(rect.right) + srcTw - 1) / srcTw;
+        const uint32_t r0 = uint32_t(rect.top) / kTileRows, r1 = (uint32_t(rect.bottom) + kTileRows - 1) / kTileRows;
+        if (c1 <= c0 || r1 <= r0) return;
+
+        for (auto& [key, rtPtr] : m_renderTargets) {
+            RenderTarget* rt = rtPtr.get();
+            if (rt == source || rt->isDepth || rt->edramBase >= kEdramTiles || !rt->used) continue;
+            const uint32_t tw = tileWidth(*rt), tpr = tilesPerRow(*rt);
+            std::vector<plume::RenderRect> rects;
+            for (uint32_t r = r0; r < r1; ++r) {
+                const uint32_t start = source->edramBase + r * srcTpr + c0;
+                for (uint32_t i = 0; i < c1 - c0;) {
+                    // Tile relativa ao RT de destino, com a volta do EDRAM.
+                    const uint32_t rel = (start + i + kEdramTiles - rt->edramBase) % kEdramTiles;
+                    const uint32_t row = rel / tpr, col = rel % tpr;
+                    // Tiles consecutivas na mesma linha do destino viram um retangulo so.
+                    const uint32_t run = std::min(c1 - c0 - i, tpr - col);
+                    const uint32_t y = row * kTileRows;
+                    if (y < rt->height) {
+                        const uint32_t x0 = col * tw, x1 = std::min((col + run) * tw, rt->width);
+                        if (x1 > x0) {
+                            rects.emplace_back(int32_t(x0), int32_t(y), int32_t(x1), int32_t(std::min(y + kTileRows, rt->height)));
+                        }
+                    }
+                    i += run;
+                }
+            }
+            if (rects.empty()) continue;
+            Transition(rt, plume::RenderTextureLayout::COLOR_WRITE);
+            RenderTarget* targets[1] = { rt };
+            BindFramebuffer(GetFramebuffer(targets, 1, nullptr));
+            m_commandList->clearColor(0, plume::RenderColor(0.0f, 0.0f, 0.0f, 0.0f), rects.data(), uint32_t(rects.size()));
+        }
+    }
+
     // ------------------------------------------------------------------ apresentacao
 
     plume::RenderCommandList* XenosRenderer::RecordPresent(plume::RenderTexture* target, plume::RenderFramebuffer* framebuffer,
                                                            uint32_t targetWidth, uint32_t targetHeight, uint32_t frontbufferAddr,
                                                            uint32_t frontbufferWidth, uint32_t frontbufferHeight,
                                                            const float clearColor[4]) {
+        // GL_DUMP_FRAME=<n>: no n-esimo present grava cada textura resolvida (RGBA8 ou RGBA16F) em
+        // build/dump/<endereco>_<w>x<h>.bmp, para depurar as etapas do quadro.
+        static const int dumpFrame = std::getenv("GL_DUMP_FRAME") ? std::atoi(std::getenv("GL_DUMP_FRAME")) : -1;
+        static int presentIndex = 0;
+        // GL_DUMP_STEP=<k>: repete a cada k presents a partir de GL_DUMP_FRAME. GL_DUMP_ADDR=<hex,...>
+        // limita aos enderecos listados.
+        static const int dumpStep = std::getenv("GL_DUMP_STEP") ? std::atoi(std::getenv("GL_DUMP_STEP")) : 0;
+        static const std::set<uint32_t> dumpAddrs = [] {
+            std::set<uint32_t> s;
+            if (const char* e = std::getenv("GL_DUMP_ADDR")) {
+                for (const char* p = e; *p;) {
+                    char* end = nullptr;
+                    s.insert(uint32_t(std::strtoul(p, &end, 16)));
+                    if (end == p) break;
+                    p = (*end == ',') ? end + 1 : end;
+                }
+            }
+            return s;
+        }();
+        const int thisPresent = presentIndex++;
+        const bool dumpNow = dumpFrame >= 0 && (thisPresent == dumpFrame ||
+                                                (dumpStep > 0 && thisPresent > dumpFrame && (thisPresent - dumpFrame) % dumpStep == 0));
+        if (dumpNow) {
+            std::filesystem::create_directories("build/dump");
+            for (const auto& [address, rt] : m_resolved) {
+                if (!dumpAddrs.empty() && !dumpAddrs.count(address)) continue;
+                const bool half = rt->format == plume::RenderFormat::R16G16B16A16_FLOAT;
+                const bool r32f = rt->format == plume::RenderFormat::R32_FLOAT;  // profundidade resolvida
+                if (rt->format != plume::RenderFormat::R8G8B8A8_UNORM && !half && !r32f) continue;
+                const uint32_t bpp = half ? 8 : 4;
+                float minValue = 1e30f;
+                const uint32_t w = rt->width, h = rt->height;
+                const uint32_t rowPitch = (w * bpp + 255) & ~255u;
+                auto readback = m_device->createBuffer(plume::RenderBufferDesc::ReadbackBuffer(uint64_t(rowPitch) * h));
+                if (!readback) continue;
+                EnsureRecording();
+                m_commandList->barriers(plume::RenderBarrierStage::COPY,
+                                        plume::RenderTextureBarrier(rt->texture.get(), plume::RenderTextureLayout::COPY_SOURCE));
+                m_commandList->copyTextureRegion(
+                    plume::RenderTextureCopyLocation::PlacedFootprint(readback.get(), rt->format, w, h, 1, rowPitch / bpp, 0),
+                    plume::RenderTextureCopyLocation::Subresource(rt->texture.get()));
+                m_commandList->barriers(plume::RenderBarrierStage::GRAPHICS,
+                                        plume::RenderTextureBarrier(rt->texture.get(), plume::RenderTextureLayout::SHADER_READ));
+                SubmitAndWait();
+                const uint8_t* mapped = static_cast<const uint8_t*>(readback->map());
+                if (!mapped) continue;
+                std::vector<uint8_t> bgr(size_t(w) * h * 3);
+                float maxValue = 0.0f;
+                uint64_t nanCount = 0, infCount = 0;
+                for (uint32_t y = 0; y < h; ++y) {
+                    for (uint32_t x = 0; x < w; ++x) {
+                        const uint8_t* p = mapped + size_t(y) * rowPitch + size_t(x) * bpp;
+                        uint8_t* o = bgr.data() + (size_t(h - 1 - y) * w + x) * 3;
+                        for (int c = 0; c < 3; ++c) {
+                            float v;
+                            if (half) {
+                                uint16_t hv;
+                                std::memcpy(&hv, p + c * 2, 2);
+                                v = _mm_cvtss_f32(_mm_cvtph_ps(_mm_set1_epi16(static_cast<short>(hv))));
+                            } else if (r32f) {
+                                std::memcpy(&v, p, 4);
+                                if (c == 0) minValue = std::min(minValue, v);
+                            } else {
+                                v = p[c] / 255.0f;
+                            }
+                            if (std::isnan(v)) ++nanCount;
+                            else if (std::isinf(v)) ++infCount;
+                            else maxValue = std::max(maxValue, v);
+                            o[2 - c] = static_cast<uint8_t>(std::clamp(v, 0.0f, 1.0f) * 255.0f);
+                        }
+                    }
+                }
+                readback->unmap();
+                char name[96];
+                std::snprintf(name, sizeof(name), "build/dump/f%05d_%08X_%ux%u_%s.bmp", thisPresent, address, w, h,
+                              half ? "f16" : (r32f ? "r32f" : "rgba8"));
+                if (r32f) std::fprintf(stderr, "[dump] %s min %.6f\n", name, minValue);
+                std::ofstream file(name, std::ios::binary);
+                const uint32_t dataSize = uint32_t(bgr.size()), rowBytes = w * 3;
+                const uint32_t paddedRow = (rowBytes + 3) & ~3u;
+                const uint32_t fileSize = 54 + paddedRow * h;
+                uint8_t header[54] = {'B', 'M'};
+                auto put32 = [&](int off, uint32_t v) { std::memcpy(header + off, &v, 4); };
+                put32(2, fileSize); put32(10, 54); put32(14, 40); put32(18, w); put32(22, h);
+                header[26] = 1; header[28] = 24; put32(34, paddedRow * h);
+                file.write(reinterpret_cast<const char*>(header), 54);
+                const uint8_t pad[3] = {};
+                for (uint32_t y = 0; y < h; ++y) {
+                    file.write(reinterpret_cast<const char*>(bgr.data() + size_t(y) * rowBytes), rowBytes);
+                    file.write(reinterpret_cast<const char*>(pad), paddedRow - rowBytes);
+                }
+                (void)dataSize;
+                std::fprintf(stderr, "[dump] %s (max %.3f nan %llu inf %llu)\n", name, maxValue, (unsigned long long)nanCount,
+                             (unsigned long long)infCount);
+            }
+        }
+
         EnsureRecording();
         m_commandList->barriers(plume::RenderBarrierStage::GRAPHICS,
                                 plume::RenderTextureBarrier(target, plume::RenderTextureLayout::COLOR_WRITE));
@@ -1151,6 +1694,13 @@ void main() {
         m_commandList->setViewports(plume::RenderViewport(0.0f, 0.0f, float(targetWidth), float(targetHeight)));
         m_commandList->setScissors(plume::RenderRect(0, 0, int32_t(targetWidth), int32_t(targetHeight)));
 
+        static const bool tracePresent = std::getenv("GL_TRACE_PRESENT") != nullptr;
+        static int tracedPresents = 0;
+        if (tracePresent && (tracedPresents++ < 12 || tracedPresents % 300 == 0)) {
+            std::fprintf(stderr, "[present] frontbuffer=%08X %ux%u; destinos de resolve:", frontbufferAddr, frontbufferWidth, frontbufferHeight);
+            for (const auto& entry : m_resolved) std::fprintf(stderr, " %08X(%ux%u)", entry.first, entry.second->width, entry.second->height);
+            std::fprintf(stderr, "\n");
+        }
         auto resolved = m_resolved.find(frontbufferAddr);
         if (resolved != m_resolved.end()) {
             auto set = m_device->createDescriptorSet(*m_presentSetDesc);

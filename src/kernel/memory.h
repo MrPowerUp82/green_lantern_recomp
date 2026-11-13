@@ -25,6 +25,13 @@ namespace Kernel {
         static GuestAddr AllocateVirtual(GuestSize size, uint32_t protection = 0x04 /* PAGE_READWRITE */);
         static void FreeVirtual(GuestAddr address);
 
+        // Alocacao com alinhamento: physical usa a faixa 0xA0000000 (fisico == virtual neste port);
+        // fixedAddress != 0 reserva exatamente esse endereco. Memoria zerada e commitada.
+        static GuestAddr AllocateAligned(GuestSize size, uint32_t alignment, bool physical, GuestAddr fixedAddress = 0);
+
+        // Tamanho do bloco alocado em address (ou do restante, se for um endereco interno); 0 se desconhecido.
+        static GuestSize AllocationSize(GuestAddr address);
+
         // Acesso direto com segurança
         template<typename T>
         static T* TranslateGuest(GuestAddr addr) {

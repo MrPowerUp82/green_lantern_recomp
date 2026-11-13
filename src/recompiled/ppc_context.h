@@ -1,6 +1,9 @@
 #pragma once
 #include "ppc_config.h"
 
+#pragma once
+#include "ppc_config.h"
+
 #ifndef PPC_CONTEXT_H_INCLUDED
 #define PPC_CONTEXT_H_INCLUDED
 
@@ -29,6 +32,17 @@
 #define __builtin_clz(x) __lzcnt(static_cast<unsigned int>(x))
 #define __restrict__ __restrict
 #define __attribute__(x)
+#define __builtin_debugtrap() __debugbreak()
+#define __builtin_unreachable() __assume(0)
+#define __builtin_clzll(x) static_cast<int>(__lzcnt64(static_cast<unsigned __int64>(x)))
+#include <atomic>
+template<typename T, typename E, typename N>
+inline bool ppc_sync_bool_cas(T* ptr, E expected, N desired)
+{
+    T exp = static_cast<T>(expected);
+    return std::atomic_ref<T>(*ptr).compare_exchange_strong(exp, static_cast<T>(desired));
+}
+#define __sync_bool_compare_and_swap(p, o, n) ppc_sync_bool_cas((p), (o), (n))
 #endif
 
 #include <x86/avx.h>
@@ -718,5 +732,8 @@ inline uint64_t __rdtsc()
 #elif !defined(__x86_64__) && !defined(_M_X64)
 #   error "Missing implementation for __rdtsc()"
 #endif
+
+// Relogio de 50 MHz do Xbox 360 (mftb); implementado por src/kernel/kernel_state.cpp.
+extern "C" uint64_t ppc_get_timebase();
 
 #endif

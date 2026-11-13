@@ -37,7 +37,7 @@ namespace Graphics {
 
         // Liga o renderer de draws do Xenos (so no backend Vulkan: os shaders traduzidos sao SPIR-V).
         // Chamar depois de Initialize e antes de iniciar o CP. false se o backend nao suporta draws.
-        static bool AttachGuestMemory(uint8_t* guestBase);
+        static bool AttachGuestMemory(uint8_t* guestBase, bool physicalAlias = false);
         static bool HasXenosRenderer();
 
         // Draws e resolves do Xenos (thread do CP).

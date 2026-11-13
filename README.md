@@ -31,6 +31,51 @@ Projeto de recompilação estática nativa (Static Binary Recompilation) para PC
 * Ninja (opcional, para builds ultra-rápidos)
 * GPU compatível com Vulkan 1.2 ou DirectX 12 (Shader Model 6)
 
+## Gerando e compilando o jogo (Windows / MSVC)
+
+O jogo precisa do `game/default.xex` e dos assets em `game/` (nao versionados). Os passos abaixo geram o
+codigo recompilado e o executavel; todos os caminhos sao relativos a raiz do repositorio.
+
+```powershell
+# 1. XenonRecomp (gerador) e as ferramentas de apoio
+git clone --recurse-submodules https://github.com/hedge-dev/XenonRecomp.git tools/XenonRecomp
+cmake -S tools/XenonRecomp -B tools/XenonRecomp/build -G "Visual Studio 18 2026" -A x64
+cmake --build tools/XenonRecomp/build --config Release --target XenonRecomp XenonAnalyse
+cmake -S tools/dump_xex_image -B build/dump_xex_image
+cmake --build build/dump_xex_image --config Release
+
+# 2. Imagem descompactada do XEX + tabela de imports (game/default.image e default.image.imports.txt)
+build/dump_xex_image/Release/dump_xex_image.exe game/default.xex game/default.image
+
+# 3. Tabelas de switch (tools/jump_table.toml) e geracao do codigo C++ (src/recompiled/ppc_recomp.*.cpp)
+python tools/find_jump_tables.py game/default.image tools/jump_table.toml
+tools/XenonRecomp/build/XenonRecomp/Release/XenonRecomp.exe config.toml tools/ppc_context.h
+python tools/find_branch_targets.py      # declara em config.toml as entradas de funcao que faltam
+tools/XenonRecomp/build/XenonRecomp/Release/XenonRecomp.exe config.toml tools/ppc_context.h
+# repita find_branch_targets.py + XenonRecomp ate nao restar "// ERROR" em src/recompiled
+
+# 4. Executavel
+cmake -S . -B build -DGREEN_LANTERN_BUILD_GAME=ON
+cmake --build build --config Release --target GreenLanternRecomp
+build/bin/Release/GreenLanternRecomp.exe
+```
+
+Observacoes sobre as ferramentas:
+
+* O XenonRecomp precisa de pequenos patches locais (nao ha clang no VS Build Tools): `byteswap.h` para MSVC,
+  instrucoes que faltavam (formas "update" `lhzu`/`sthu`/`lfsu`/`stfsu`, `addc`, `subfze`, `eqv`, `vsel128`,
+  `bdzf`, ...), branches de CTR para fora da funcao e `mftb` com o relogio de 50 MHz do Xbox 360
+  (`ppc_get_timebase`). Eles ficam em `tools/XenonRecomp` (repositorio aninhado, ignorado pelo Git).
+* O gerador sobrescreve `src/recompiled/ppc_context.h` com o arquivo passado como segundo argumento. Use
+  `tools/ppc_context.h`, que ja traz os shims de MSVC (`__builtin_*`, `__sync_bool_compare_and_swap`).
+* As unidades com funcoes gigantes (>= 5000 linhas) compilam sem otimizacao (`slow_units.cmake`); com `/O2`
+  o MSVC leva horas nelas.
+* `GL_TRACE_KERNEL=1` imprime cada chamada ao kernel (nome, argumentos e retorno). Em falhas do host o
+  executavel mostra o endereco acessado, os registradores e a pilha do guest.
+* Sem controle XInput, o teclado simula o controle 0: WASD = analogico esquerdo, setas = direito, Espaco = A,
+  E = B, Q = X, R = Y, 1/3 = LB/RB, Shift = LT, Z = RT, Enter = Start, Backspace = Back, Ctrl esq. = L3, C = R3,
+  IJKL = direcional.
+
 ## Renderer nativo
 
 A GPU Xenos é emulada no nível do PM4 (o D3D do 360 está inlinado no jogo e sem símbolos):

@@ -12,7 +12,7 @@ namespace Gpu {
         // Ultima regiao commitada vista nesta thread: a maioria das consultas cai nela.
         thread_local const uint8_t* cachedLo = nullptr;
         thread_local const uint8_t* cachedHi = nullptr;
-        const uint8_t* lo = m_base + addr;
+        const uint8_t* lo = Ptr(addr);
         const uint8_t* hi = lo + sizeBytes;
         if (lo >= cachedLo && hi <= cachedHi) return true;
         const uint8_t* p = lo;

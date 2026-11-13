@@ -13,7 +13,7 @@ namespace Gpu {
         m_userData = userData;
     }
 
-    void InterruptDispatcher::Dispatch(uint32_t source, uint32_t /*cpu*/) {
+    void InterruptDispatcher::Dispatch(uint32_t source, uint32_t cpu) {
         if (!m_enabled.load() || !m_caller) return;
 
         GuestAddr fn;
@@ -26,6 +26,7 @@ namespace Gpu {
         if (fn == 0) return;  // so depois de registrado
 
         std::lock_guard<std::mutex> lock(m_callMutex);
+        InterruptCpu() = cpu;
         m_caller(fn, source, userData);
     }
 

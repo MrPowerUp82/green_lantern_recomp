@@ -37,7 +37,7 @@ namespace Gpu {
     // Emula o command processor do Xenos: consome o ring buffer PM4 escrito pelo D3D do jogo.
     class CommandProcessor {
     public:
-        CommandProcessor(uint8_t* base, IGpuBackend* backend, IInterruptSink* interrupts);
+        CommandProcessor(uint8_t* base, IGpuBackend* backend, IInterruptSink* interrupts, bool physicalAlias = false);
         ~CommandProcessor();
         CommandProcessor(const CommandProcessor&) = delete;
         CommandProcessor& operator=(const CommandProcessor&) = delete;

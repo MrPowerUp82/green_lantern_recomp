@@ -25,7 +25,7 @@ namespace Gpu::Draw {
             const uint32_t resetIndex = resetReg.reset_indx & (indexBytes == 2 ? 0xFFFFu : 0xFFFFFFu);
 
             out.resize(count);
-            const uint8_t* base = memory.Base() + draw.indexBase;
+            const uint8_t* base = memory.Ptr(draw.indexBase);
             for (uint32_t i = 0; i < count; ++i) {
                 uint32_t value;
                 if (indexBytes == 2) {

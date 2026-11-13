@@ -14,6 +14,13 @@ namespace Gpu {
     // Kernel::CreateGuestCaller; nos testes e um fake que so registra a chamada.
     using GuestCaller = std::function<void(GuestAddr fn, uint32_t arg0, uint32_t arg1)>;
 
+    // Numero do processador (0-5) do interrupt em despacho nesta thread: o callback guest o le em
+    // PCR+0x10C (o ISR do D3D limpa o bit 1 << cpu na mascara do pacote INTERRUPT).
+    inline uint32_t& InterruptCpu() {
+        thread_local uint32_t cpu = 0;
+        return cpu;
+    }
+
     // Despacha o callback registrado por VdSetGraphicsInterruptCallback.
     //   source 0 = vblank, source 1 = pacote PM4 INTERRUPT.
     class InterruptDispatcher final : public IInterruptSink {

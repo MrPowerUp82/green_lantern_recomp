@@ -20,6 +20,7 @@
 namespace Graphics {
     struct XenosRendererStats {
         uint64_t draws = 0;
+        uint64_t skipReason[9] = {};  // por local de descarte em IssueDraw (ordem do arquivo)
         uint64_t drawsSkipped = 0;  // sem shader, estado sem suporte ou area vazia
         uint64_t resolves = 0;
         uint64_t clears = 0;
@@ -36,7 +37,7 @@ namespace Graphics {
     // de upload encher).
     class XenosRenderer {
     public:
-        XenosRenderer(plume::RenderDevice* device, plume::RenderCommandQueue* queue, uint8_t* guestBase);
+        XenosRenderer(plume::RenderDevice* device, plume::RenderCommandQueue* queue, uint8_t* guestBase, bool physicalAlias = false);
         ~XenosRenderer();
         XenosRenderer(const XenosRenderer&) = delete;
         XenosRenderer& operator=(const XenosRenderer&) = delete;
@@ -83,9 +84,14 @@ namespace Graphics {
             plume::RenderFormat format = plume::RenderFormat::UNKNOWN;
             uint32_t width = 0, height = 0;
             bool isDepth = false;
+            // Posicao no EDRAM do guest: tile base, pitch em pixels e 64 bits por pixel (tiles de 40x16
+            // em vez de 80x16). Usado para refletir clears em RTs que compartilham as mesmas tiles.
+            uint32_t edramBase = 0, pitch = 0;
+            bool wide = false;
             bool used = false;  // ja recebeu draw/clear desde a criacao
             plume::RenderTextureLayout layout = plume::RenderTextureLayout::UNKNOWN;
             std::unique_ptr<plume::RenderTextureView> depthView;  // para copiar a profundidade
+            std::unique_ptr<plume::RenderTextureView> colorView;  // para o resolve com exp_bias
         };
 
         struct CachedTexture {
@@ -101,8 +107,15 @@ namespace Graphics {
             std::unique_ptr<plume::RenderTexture> texture;
             std::unique_ptr<plume::RenderTextureView> view;
             std::unique_ptr<plume::RenderFramebuffer> framebuffer;  // so para resolves de profundidade
+            // Resolve de profundidade lido como k_8_8_8_8: bytes do D24S8/D24FS8 (stencil, depth baixo..alto).
+            std::unique_ptr<plume::RenderTexture> encoded;
+            std::unique_ptr<plume::RenderTextureView> encodedView;
+            std::unique_ptr<plume::RenderFramebuffer> encodedFramebuffer;
             plume::RenderFormat format = plume::RenderFormat::UNKNOWN;
             uint32_t width = 0, height = 0;
+            // Bytes por linha na memoria do guest (pitch * bytes do formato de destino): resolves em
+            // faixas (tiling do EDRAM) caem em base + n * guestRowBytes e vao para a linha n desta textura.
+            uint32_t guestRowBytes = 0;
         };
 
         struct BoundTexture {
@@ -124,14 +137,24 @@ namespace Graphics {
                                            const Gpu::Draw::RenderState& state, const Gpu::Draw::HostPrimitive& primitive,
                                            plume::RenderFormat colorFormats[4], uint32_t colorCount,
                                            plume::RenderFormat depthFormat);
-        RenderTarget* GetRenderTarget(uint32_t edramBase, uint32_t pitch, plume::RenderFormat format, bool isDepth);
+        RenderTarget* GetRenderTarget(uint32_t edramBase, uint32_t pitch, plume::RenderFormat format, bool isDepth,
+                                      bool wide = false);
+        // Um clear de cor com valor bruto zero apaga as tiles do EDRAM; os outros RTs de cor que usam
+        // essas tiles (aliasing) tambem sao zerados, como no hardware.
+        void PropagateZeroClear(const RenderTarget* source, const plume::RenderRect& rect);
         plume::RenderFramebuffer* GetFramebuffer(RenderTarget* const* colors, uint32_t colorCount, RenderTarget* depth);
         BoundTexture GetTexture(uint32_t fetchConstant, const Gpu::RegisterFileView& regs);
         plume::RenderSampler* GetSampler(const xe::gpu::xenos::xe_gpu_texture_fetch_t& fetch,
                                          const Gpu::Shader::TextureBinding& binding);
         bool InitializePresent();
         // Copia de profundidade (D32S8 -> R32F) por um passe de tela cheia, para resolves de depth.
-        bool CopyDepth(RenderTarget* source, ResolvedTexture& dest, const plume::RenderRect& rect);
+        // `rect` e o retangulo de destino; a origem e lida em (x, y - destYOffset).
+        bool CopyDepth(RenderTarget* source, ResolvedTexture& dest, const plume::RenderRect& rect, int32_t destYOffset);
+        bool EncodeDepth(RenderTarget* source, ResolvedTexture& dest, const plume::RenderRect& rect, bool floatDepth,
+                         int32_t destYOffset);
+        // Resolve de cor com conversao: valor * 2^expBias, limitado a [clampMin, clampMax].
+        bool CopyColorScaled(RenderTarget* source, ResolvedTexture& dest, const plume::RenderRect& rect, float scale,
+                             float clampMin, float clampMax, int32_t destYOffset);
         // Barreira so quando o layout muda (cada barreira do Plume encerra o render pass).
         void Transition(RenderTarget* target, plume::RenderTextureLayout layout);
         void BindFramebuffer(plume::RenderFramebuffer* framebuffer);
@@ -161,7 +184,7 @@ namespace Graphics {
         std::unordered_map<uint64_t, std::unique_ptr<ShaderEntry>> m_shaders;
         std::map<std::string, std::unique_ptr<LayoutEntry>> m_layouts;
         std::unordered_map<std::string, std::unique_ptr<plume::RenderPipeline>> m_pipelines;
-        std::map<std::tuple<uint32_t, uint32_t, int, bool>, std::unique_ptr<RenderTarget>> m_renderTargets;
+        std::map<std::tuple<uint32_t, uint32_t, int, bool, bool>, std::unique_ptr<RenderTarget>> m_renderTargets;
         std::map<std::vector<const void*>, std::unique_ptr<plume::RenderFramebuffer>> m_framebuffers;
         std::unordered_map<uint64_t, std::unique_ptr<CachedTexture>> m_textures;
         std::unordered_map<uint64_t, std::unique_ptr<plume::RenderSampler>> m_samplers;
@@ -186,6 +209,10 @@ namespace Graphics {
         std::unique_ptr<plume::RenderSampler> m_presentSampler;
         std::unique_ptr<plume::RenderShader> m_depthCopyPs;
         std::unique_ptr<plume::RenderPipeline> m_depthCopyPipeline;
+        std::unique_ptr<plume::RenderShader> m_colorCopyPs;
+        std::unique_ptr<plume::RenderShader> m_depthEncodePs;
+        std::unique_ptr<plume::RenderPipeline> m_depthEncodePipeline;
+        std::map<int, std::unique_ptr<plume::RenderPipeline>> m_colorCopyPipelines;  // por formato de destino
 
         plume::RenderFramebuffer* m_currentFramebuffer = nullptr;
         XenosRendererStats m_stats;

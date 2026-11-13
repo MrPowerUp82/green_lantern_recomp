@@ -201,7 +201,10 @@ PPC_FUNC(__imp__VdSwap) {
 
     // A fetch constant do D3D guarda o endereco virtual do frontbuffer em dword_1[31:12]. Como
     // MmGetPhysicalAddress e a identidade neste port, ele ja e o endereco que o CP usa.
-    const uint32_t frontbuffer = (fetchDwords[1] >> 12) << 12;
+    uint32_t frontbuffer = (fetchDwords[1] >> 12) << 12;
+    // O D3D pode guardar o endereco virtual (0xA0000000+) da memoria "fisica"; os resolves da GPU usam o
+    // fisico (virt & 0x1FFFFFFF). Normaliza para casar com o destino do resolve.
+    if (frontbuffer >= 0xA0000000u && frontbuffer < 0xC0000000u) frontbuffer &= 0x1FFFFFFFu;
     const uint32_t width = mem.LoadBe32(widthPtr);
     const uint32_t height = mem.LoadBe32(heightPtr);
 

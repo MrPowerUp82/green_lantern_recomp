@@ -18,3 +18,10 @@ if (MSVC)
 else()
     target_compile_options(RecompiledCode PRIVATE -mavx2 -mfma -O3 -w)
 endif()
+
+# Estas unidades tem funcoes de milhares de linhas com muitos goto; o otimizador do MSVC leva horas
+# nelas com /O2. Sem otimizacao compilam em segundos (o codigo gerado e o mesmo, so mais lento).
+include(${CMAKE_CURRENT_SOURCE_DIR}/slow_units.cmake OPTIONAL)
+if (MSVC AND PPC_SLOW_UNITS)
+    set_source_files_properties(${PPC_SLOW_UNITS} PROPERTIES COMPILE_OPTIONS "/Od")
+endif()

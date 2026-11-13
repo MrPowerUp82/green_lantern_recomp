@@ -303,14 +303,14 @@ namespace Graphics {
         s_resizePending = true;
     }
 
-    bool NativeRenderer::AttachGuestMemory(uint8_t* guestBase) {
+    bool NativeRenderer::AttachGuestMemory(uint8_t* guestBase, bool physicalAlias) {
         if (!s_initialized || !s_gpu || !guestBase) return false;
         if (s_config.backend != Backend::Vulkan) {
             std::cerr << "[Renderer] Draws do Xenos exigem Vulkan (shaders SPIR-V); o backend "
                       << GetBackendName() << " so apresenta." << std::endl;
             return false;
         }
-        auto xenos = std::make_unique<XenosRenderer>(s_gpu->device.get(), s_gpu->queue.get(), guestBase);
+        auto xenos = std::make_unique<XenosRenderer>(s_gpu->device.get(), s_gpu->queue.get(), guestBase, physicalAlias);
         if (!xenos->Initialize()) {
             std::cerr << "[Renderer] Falha ao inicializar o renderer de draws do Xenos." << std::endl;
             return false;
@@ -338,7 +338,11 @@ namespace Graphics {
         if (!s_gpu || !s_gpu->xenos) return "renderer de draws inativo";
         const XenosRendererStats& st = s_gpu->xenos->Stats();
         std::ostringstream out;
-        out << "draws=" << st.draws << " pulados=" << st.drawsSkipped << " resolves=" << st.resolves
+        out << "draws=" << st.draws << " pulados=" << st.drawsSkipped
+            << " [motivos";
+        for (int i = 0; i < 9; i++) out << " " << st.skipReason[i];
+        out << "]"
+            << " resolves=" << st.resolves
             << " clears=" << st.clears << " texturas=" << st.texturesUploaded << " shaders=" << st.shadersCompiled
             << " falhas_shader=" << st.shaderFailures << " pipelines=" << st.pipelinesCreated
             << " apresentacoes=" << st.presentsFromResolve;

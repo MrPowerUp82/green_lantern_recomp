@@ -1,5 +1,7 @@
 #include "guest_thread.h"
 #include "memory.h"
+#include "kernel_state.h"
+#include "platform/crash_handler.h"
 #include "../recompiled/ppc_recomp_shared.h"
 #include <atomic>
 #include <cstring>
@@ -23,18 +25,17 @@ namespace Kernel {
     static void RunMain() {
         uint8_t* base = MemoryManager::GetBase();
 
-        // PCR/TLS do Xenon: r13 aponta para o bloco por-thread (PCR) alocado no heap do guest
-        GuestAddr pcr = MemoryManager::AllocateVirtual(GuestThread::kPcrSize);
-        std::memset(base + pcr, 0, GuestThread::kPcrSize);
-        // PCR+0x70 = topo da stack, PCR+0x74 = base... (campos preenchidos conforme o jogo exigir)
-        Endian::WriteBe32(base + pcr + 0x70, GuestThread::kStackBase + GuestThread::kStackSize);
-        Endian::WriteBe32(base + pcr + 0x74, GuestThread::kStackBase);
+        // Thread 1 do jogo: o PCR/KTHREAD vem de InitThreadContext; a stack e a fixa de GuestThread.
+        ThreadInfo& info = CurrentThread();
+        info.stackBase = GuestThread::kStackBase;
+        info.stackSize = GuestThread::kStackSize;
 
         PPCContext ctx{};
         ctx.fpscr.loadFromHost();
+        InitThreadContext(info, ctx, 0);
         ctx.r1.u64 = GuestThread::kStackBase + GuestThread::kStackSize - 0x100; // stack pointer (alinhado a 16)
-        ctx.r13.u64 = pcr;
         ctx.lr = 0;
+        Platform::SetCrashContext(&ctx);
 
         std::cout << "[Guest] Thread principal: r1=0x" << std::hex << ctx.r1.u32
                   << " r13=0x" << ctx.r13.u32 << " entry=0x" << GuestThread::kEntryPoint

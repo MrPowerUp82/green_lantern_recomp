@@ -1,0 +1,2 @@
+# Gerado por tools/find_branch_targets.py: unidades com funcoes de milhares de linhas.
+set(PPC_SLOW_UNITS ppc_recomp.5.cpp ppc_recomp.6.cpp ppc_recomp.8.cpp ppc_recomp.12.cpp ppc_recomp.20.cpp ppc_recomp.26.cpp ppc_recomp.57.cpp ppc_recomp.60.cpp ppc_recomp.61.cpp ppc_recomp.63.cpp ppc_recomp.65.cpp ppc_recomp.69.cpp ppc_recomp.84.cpp ppc_recomp.108.cpp ppc_recomp.117.cpp ppc_recomp.123.cpp ppc_recomp.125.cpp)

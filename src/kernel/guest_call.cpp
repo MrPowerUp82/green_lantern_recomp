@@ -2,6 +2,10 @@
 
 #include "../recompiled/ppc_context.h"
 #include "guest_thread.h"
+#include "kernel_state.h"
+#include "gpu/interrupts.h"
+
+#include <cstdio>
 
 #include <cstring>
 #include <iostream>
@@ -50,6 +54,8 @@ namespace Kernel {
                 state->ready = true;
             }
 
+            // PCR+0x10C: numero do processador do interrupt (ver Gpu::InterruptCpu).
+            base[state->pcr + 0x10C] = static_cast<uint8_t>(Gpu::InterruptCpu());
             PPCContext ctx{};
             ctx.fpscr.loadFromHost();
             ctx.r1.u64 = state->stack + kCallbackStackSize - 0x100;
@@ -57,7 +63,9 @@ namespace Kernel {
             ctx.r3.u64 = arg0;
             ctx.r4.u64 = arg1;
             ctx.lr = 0;
+            if (g_traceKernel) std::fprintf(stderr, "[trace isr t%u] callback %08X(%u, %08X)\n", CurrentThread().id, fn, arg0, arg1);
             host(ctx, base);
+            if (g_traceKernel) std::fprintf(stderr, "[trace isr t%u] callback %08X retornou\n", CurrentThread().id, fn);
         };
     }
 }

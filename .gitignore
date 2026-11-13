@@ -28,3 +28,10 @@ Thumbs.db
 
 .worktrees/
 thirdparty/
+
+# XenonRecomp clonado localmente (com patches de MSVC), saves do runtime
+tools/XenonRecomp/
+save/
+
+# Cache do Python
+__pycache__/

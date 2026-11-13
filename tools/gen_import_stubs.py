@@ -17,7 +17,7 @@ import sys
 from pathlib import Path
 
 IMPORT_RE = re.compile(r"PPC_EXTERN_FUNC\((__imp__\w+)\)")
-IMPL_RE = re.compile(r"^PPC_FUNC\((__imp__\w+)\)", re.MULTILINE)
+IMPL_RE = re.compile(r"^(?:PPC_FUNC|KERNEL_FUNC)\((__imp__\w+)\)", re.MULTILINE)
 
 HEADER = """\
 // GERADO por tools/gen_import_stubs.py -- nao edite a mao.

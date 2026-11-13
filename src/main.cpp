@@ -1,8 +1,10 @@
 #include <iostream>
 #include "types.h"
 #include "platform/filesystem.h"
+#include "platform/crash_handler.h"
 #include "kernel/memory.h"
 #include "kernel/kernel_stubs.h"
+#include "kernel/xex_module.h"
 #include "kernel/guest_thread.h"
 #include "kernel/guest_call.h"
 #include <chrono>
@@ -35,11 +37,20 @@ int main(int argc, char** argv) {
     }
 
     // 3. Carregar seções do binário original descompactado no espaço 0x82000000
-    auto pePath = Platform::VFS::ResolvePath("game:/default_unpacked.pe");
+    auto pePath = Platform::VFS::ResolvePath("game:/default.image");
     if (std::filesystem::exists(pePath)) {
         Kernel::MemoryManager::LoadExecutableImage(pePath);
     } else {
-        std::cerr << "[Main] Atenção: Imagem " << pePath << " não encontrada. Rode tools/unpack_xex.py primeiro.\n";
+        std::cerr << "[Main] Atenção: Imagem " << pePath << " não encontrada. Rode tools/dump_xex_image primeiro (README).\n";
+    }
+
+    Platform::InstallCrashHandler(Kernel::MemoryManager::GetBase());
+
+    // 3b. Modulo XEX: cabecalho, IAT (variaveis do kernel e thunks) e relogio do kernel.
+    if (!Kernel::LoadXexModule(Platform::VFS::ResolvePath("game:/default.xex"),
+                               Platform::VFS::ResolvePath("game:/default.image.imports.txt"))) {
+        std::cerr << "[Main] Falha ao preparar o modulo XEX do jogo." << std::endl;
+        return 1;
     }
 
     // 4. Mapear tabela de despacho de funções (PPCFuncMappings -> O(1) direct call table)
@@ -66,7 +77,7 @@ int main(int argc, char** argv) {
         return 1;
     }
     // Draws, resolves e frontbuffer do jogo (exige Vulkan; no D3D12 a janela so limpa a tela).
-    if (!Graphics::NativeRenderer::AttachGuestMemory(Kernel::MemoryManager::GetBase())) {
+    if (!Graphics::NativeRenderer::AttachGuestMemory(Kernel::MemoryManager::GetBase(), true)) {
         std::cerr << "[Main] Renderer de draws do Xenos indisponivel: os quadros ficarao vazios." << std::endl;
     }
 
@@ -81,6 +92,7 @@ int main(int argc, char** argv) {
     gpuConfig.allocate = allocateGuest;
     gpuConfig.caller = Kernel::CreateGuestCaller(gpuConfig.base, allocateGuest);
     gpuConfig.enableInterrupts = gpuInterrupts;
+    gpuConfig.physicalAlias = true;
     if (!Gpu::GpuSystem::Get().Initialize(gpuConfig)) {
         std::cerr << "[Main] Falha ao inicializar a GPU emulada." << std::endl;
         Graphics::NativeRenderer::Shutdown();
@@ -99,9 +111,21 @@ int main(int argc, char** argv) {
     }
 
     // Loop da thread principal: so a janela. A apresentacao acontece na thread do CP (pacote XE_SWAP).
+    // GL_STATS=1: estatisticas do command processor e do renderer a cada 2 s.
+    const bool showStats = std::getenv("GL_STATS") != nullptr;
+    auto nextStats = std::chrono::steady_clock::now() + std::chrono::seconds(2);
     while (Graphics::NativeRenderer::IsRunning() && Kernel::GuestThread::IsRunning()) {
         Graphics::NativeRenderer::PollEvents();
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        if (showStats && std::chrono::steady_clock::now() >= nextStats) {
+            nextStats += std::chrono::seconds(2);
+            const Gpu::CpStats st = Gpu::GpuSystem::Get().Cp().Stats();
+            std::cout << "[Stats] cp: pacotes=" << st.packets << " swaps=" << st.swaps << " draws=" << st.draws
+                      << " copias=" << st.copies << " falhas=" << st.backendFailures << " shaders=" << st.shaderLoads
+                      << " nao-tratados=" << st.unhandled << " malformados=" << st.malformed
+                      << " rptr=" << Gpu::GpuSystem::Get().Cp().ReadIndex() << "\n"
+                      << "[Stats] renderer: " << Graphics::NativeRenderer::XenosStatsText() << std::endl;
+        }
     }
 
     if (Kernel::GuestThread::IsRunning()) {

@@ -2,6 +2,8 @@
 #include "../recompiled/ppc_recomp_shared.h"
 #include "gpu/gpu_registers.h"
 #include <algorithm>
+#include <map>
+#include <mutex>
 #include <atomic>
 #include <cstring>
 #include <iostream>
@@ -23,12 +25,36 @@ namespace Kernel {
         s_allocatedSize = 0x100000000ull; // 4 GB
 
 #if defined(_WIN32)
-        s_baseMemory = static_cast<uint8_t*>(VirtualAlloc(
-            nullptr,
-            s_allocatedSize,
-            MEM_RESERVE,
-            PAGE_READWRITE
-        ));
+        // RAM fisica de 512 MB espelhada em 0xA0000000 (paginas de 64 KB), 0xC0000000 (16 MB) e 0xE0000000
+        // (4 KB): o jogo acessa a mesma memoria por qualquer uma das tres. Uma secao de arquivo mapeada
+        // tres vezes da o alias real. O espaco de 4 GB e reservado em duas partes, deixando o resto livre
+        // para as visoes; se a base escolhida nao servir, tenta outra.
+        constexpr size_t kPhysicalSize = 0x20000000;
+        HANDLE physical = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, kPhysicalSize, nullptr);
+        if (!physical) {
+            std::cerr << "[Memory] Falha ao criar a RAM fisica de 512 MB." << std::endl;
+            return false;
+        }
+        for (int attempt = 0; attempt < 16 && !s_baseMemory; attempt++) {
+            void* probe = VirtualAlloc(nullptr, s_allocatedSize, MEM_RESERVE, PAGE_READWRITE);
+            if (!probe) break;
+            VirtualFree(probe, 0, MEM_RELEASE);
+            auto* candidate = static_cast<uint8_t*>(probe);
+            if (!VirtualAlloc(candidate, 0xA0000000ull, MEM_RESERVE, PAGE_READWRITE)) continue;
+            bool mapped = true;
+            for (uint64_t window : {0xA0000000ull, 0xC0000000ull, 0xE0000000ull}) {
+                if (!MapViewOfFileEx(physical, FILE_MAP_ALL_ACCESS, 0, 0, kPhysicalSize, candidate + window)) {
+                    mapped = false;
+                    break;
+                }
+            }
+            if (!mapped) {
+                for (uint64_t window : {0xA0000000ull, 0xC0000000ull, 0xE0000000ull}) UnmapViewOfFile(candidate + window);
+                VirtualFree(candidate, 0, MEM_RELEASE);
+                continue;
+            }
+            s_baseMemory = candidate;
+        }
 
         if (!s_baseMemory) {
             std::cerr << "[Memory] Falha crítica ao reservar 4 GB de memória virtual do console." << std::endl;
@@ -71,7 +97,10 @@ namespace Kernel {
         void* gpuMmioRegion = VirtualAlloc(s_baseMemory + Gpu::Reg::kMmioBase,
             Gpu::Reg::kMmioSize, MEM_COMMIT, PAGE_READWRITE);
 
-        if (!titleRegion || !dispatchRegion || !stackRegion || !heapRegion || !gpuMmioRegion) {
+        // Registradores do XMA (decodificador de audio) em 0x7FEA0000: sem emulacao, so absorvem escritas.
+        void* xmaMmioRegion = VirtualAlloc(s_baseMemory + 0x7FEA0000, 0x10000, MEM_COMMIT, PAGE_READWRITE);
+
+        if (!titleRegion || !dispatchRegion || !stackRegion || !heapRegion || !gpuMmioRegion || !xmaMmioRegion) {
             std::cerr << "[Memory] Falha ao comitar páginas de memória essenciais." << std::endl;
             return false;
         }
@@ -86,6 +115,7 @@ namespace Kernel {
     void MemoryManager::Shutdown() {
         if (s_baseMemory) {
 #if defined(_WIN32)
+            for (uint64_t window : {0xA0000000ull, 0xC0000000ull, 0xE0000000ull}) UnmapViewOfFile(s_baseMemory + window);
             VirtualFree(s_baseMemory, 0, MEM_RELEASE);
 #endif
             s_baseMemory = nullptr;
@@ -106,6 +136,19 @@ namespace Kernel {
         }
 
         std::vector<uint8_t> buffer((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+
+        // Imagem bruta gerada por tools/dump_xex_image: ja esta no layout de memoria do guest (por RVA).
+        if (unpackedPePath.extension() == ".image") {
+            if (buffer.size() > PPC_IMAGE_SIZE) {
+                std::cerr << "[Memory] Imagem maior que PPC_IMAGE_SIZE." << std::endl;
+                return false;
+            }
+            std::memcpy(s_baseMemory + PPC_IMAGE_BASE, buffer.data(), buffer.size());
+            std::cout << "[Memory] Imagem do jogo (" << buffer.size() << " bytes) mapeada em 0x"
+                      << std::hex << PPC_IMAGE_BASE << std::dec << "." << std::endl;
+            return true;
+        }
+
         if (buffer.size() < 0x200) {
             std::cerr << "[Memory] Arquivo PE muito pequeno ou inválido." << std::endl;
             return false;
@@ -163,15 +206,126 @@ namespace Kernel {
         std::cout << "[Memory] " << count << " funções registradas com sucesso na tabela de despacho indireto." << std::endl;
     }
 
+    namespace {
+        // Heap do guest: lista livre ordenada (inicio -> tamanho) e mapa de blocos usados.
+        struct Heap {
+            std::mutex lock;
+            std::map<GuestAddr, uint32_t> freeList;
+            std::map<GuestAddr, uint32_t> used;
+            uint32_t pageSize = 0x1000;
+
+            void Init(GuestAddr begin, GuestAddr end, uint32_t page) {
+                freeList.clear();
+                used.clear();
+                freeList[begin] = end - begin;
+                pageSize = page;
+            }
+
+            GuestAddr Alloc(uint8_t* base, uint32_t size, uint32_t align, GuestAddr fixed) {
+                std::lock_guard<std::mutex> guard(lock);
+                const uint64_t sz = (uint64_t(size) + pageSize - 1) & ~uint64_t(pageSize - 1);
+                if (sz == 0 || sz > 0xFFFFFFFFull) return 0;
+                if (align < pageSize) align = pageSize;
+                for (auto it = freeList.begin(); it != freeList.end(); ++it) {
+                    const uint64_t blockEnd = uint64_t(it->first) + it->second;
+                    uint64_t start = (uint64_t(it->first) + align - 1) & ~uint64_t(align - 1);
+                    if (fixed) {
+                        if (fixed < it->first || uint64_t(fixed) + sz > blockEnd) continue;
+                        start = fixed;
+                    }
+                    if (start + sz > blockEnd) continue;
+
+                    const GuestAddr blockStart = it->first;
+                    freeList.erase(it);
+                    if (start > blockStart) freeList[blockStart] = GuestAddr(start - blockStart);
+                    if (start + sz < blockEnd) freeList[GuestAddr(start + sz)] = GuestAddr(blockEnd - (start + sz));
+                    used[GuestAddr(start)] = GuestSize(sz);
+#if defined(_WIN32)
+                    VirtualAlloc(base + start, sz, MEM_COMMIT, PAGE_READWRITE);
+#endif
+                    std::memset(base + start, 0, size_t(sz));
+                    return GuestAddr(start);
+                }
+                return 0;
+            }
+
+            uint32_t Free(GuestAddr addr) {
+                std::lock_guard<std::mutex> guard(lock);
+                auto it = used.find(addr);
+                if (it == used.end()) return 0;
+                const uint32_t size = it->second;
+                used.erase(it);
+                auto next = freeList.lower_bound(addr);
+                GuestAddr start = addr;
+                uint32_t len = size;
+                if (next != freeList.end() && addr + size == next->first) {
+                    len += next->second;
+                    next = freeList.erase(next);
+                }
+                if (next != freeList.begin()) {
+                    auto prev = std::prev(next);
+                    if (prev->first + prev->second == start) {
+                        start = prev->first;
+                        len += prev->second;
+                        freeList.erase(prev);
+                    }
+                }
+                freeList[start] = len;
+                return size;
+            }
+
+            uint32_t SizeOf(GuestAddr addr) {
+                std::lock_guard<std::mutex> guard(lock);
+                auto it = used.find(addr);
+                if (it != used.end()) return it->second;
+                // Endereco no meio de um bloco: devolve o tamanho restante a partir dele.
+                auto up = used.upper_bound(addr);
+                if (up == used.begin()) return 0;
+                --up;
+                return addr < up->first + up->second ? up->first + up->second - addr : 0;
+            }
+        };
+
+        // Heap virtual do titulo (NtAllocateVirtualMemory, stacks, buffers do kernel) e a faixa
+        // "fisica" (MmAllocatePhysicalMemoryEx), onde o port usa fisico == virtual.
+        constexpr GuestAddr kVirtualHeapBegin = 0x40000000;
+        constexpr GuestAddr kVirtualHeapEnd = 0x6F000000;
+        constexpr GuestAddr kPhysicalHeapBegin = 0xA0000000;
+        constexpr GuestAddr kPhysicalHeapEnd = 0xC0000000;
+
+        Heap& VirtualHeap() {
+            static Heap heap;
+            static std::once_flag once;
+            std::call_once(once, [] { heap.Init(kVirtualHeapBegin, kVirtualHeapEnd, 0x1000); });
+            return heap;
+        }
+
+        Heap& PhysicalHeap() {
+            static Heap heap;
+            static std::once_flag once;
+            std::call_once(once, [] { heap.Init(kPhysicalHeapBegin, kPhysicalHeapEnd, 0x1000); });
+            return heap;
+        }
+    }
+
     GuestAddr MemoryManager::AllocateVirtual(GuestSize size, uint32_t protection) {
         (void)protection;
-        static std::atomic<GuestAddr> s_heapCursor{0x40000000};
-        // Alinhamento em 64KB (padrão de página do Xenon)
-        size_t alignedSize = (size_t(size) + 0xFFFF) & ~size_t(0xFFFF);
-        return s_heapCursor.fetch_add(static_cast<GuestAddr>(alignedSize));
+        // Alinhamento em 64KB (padrao de pagina do Xenon)
+        return VirtualHeap().Alloc(s_baseMemory, size, 0x10000, 0);
+    }
+
+    GuestAddr MemoryManager::AllocateAligned(GuestSize size, uint32_t alignment, bool physical, GuestAddr fixedAddress) {
+        Heap& heap = physical ? PhysicalHeap() : VirtualHeap();
+        return heap.Alloc(s_baseMemory, size, alignment, fixedAddress);
+    }
+
+    GuestSize MemoryManager::AllocationSize(GuestAddr address) {
+        if (address >= kPhysicalHeapBegin && address < kPhysicalHeapEnd) return PhysicalHeap().SizeOf(address);
+        return VirtualHeap().SizeOf(address);
     }
 
     void MemoryManager::FreeVirtual(GuestAddr address) {
-        (void)address;
+        if (address >= kPhysicalHeapBegin && address < kPhysicalHeapEnd) PhysicalHeap().Free(address);
+        else VirtualHeap().Free(address);
     }
 }

@@ -1,5 +1,7 @@
 #include "gpu/command_processor.h"
 
+#include <cstdio>
+#include <cstdlib>
 #include <atomic>
 #include <chrono>
 #include <iostream>
@@ -45,8 +47,8 @@ namespace Gpu {
         }
     }
 
-    CommandProcessor::CommandProcessor(uint8_t* base, IGpuBackend* backend, IInterruptSink* interrupts)
-        : m_memory(base), m_backend(backend), m_interrupts(interrupts) {}
+    CommandProcessor::CommandProcessor(uint8_t* base, IGpuBackend* backend, IInterruptSink* interrupts, bool physicalAlias)
+        : m_memory(base, physicalAlias), m_backend(backend), m_interrupts(interrupts) {}
 
     CommandProcessor::~CommandProcessor() { Stop(); }
 
@@ -198,6 +200,14 @@ namespace Gpu {
         }
         for (uint32_t i = 0; i < n; i++) {
             if (!stream.Read(&d[i])) return false;
+        }
+
+        // GL_TRACE_CP=1: lista os pacotes type 3 (menos SET_CONSTANT/registradores) com os primeiros dwords.
+        static const bool traceCp = std::getenv("GL_TRACE_CP") != nullptr;
+        if (traceCp && header.opcode != Pm4::kSetConstant && header.opcode != Pm4::kSetConstant2 &&
+            header.opcode != Pm4::kSetShaderConstants) {
+            std::fprintf(stderr, "[cp] op=0x%02X n=%u d0=%08X d1=%08X d2=%08X (rptr=%u)\n", header.opcode, n,
+                         n > 0 ? d[0] : 0, n > 1 ? d[1] : 0, n > 2 ? d[2] : 0, stream.ReadIndex());
         }
 
         // Predicado de bins: o D3D do 360 nao usa tiling, mas respeitamos a mascara como o Xenia.
@@ -531,6 +541,11 @@ namespace Gpu {
             return;
         }
         m_regs[index] = value;
+        static const bool traceRegs = std::getenv("GL_TRACE_REGS") != nullptr;
+        if (traceRegs && (index == 0x2104 || index == 0x2200)) {
+            static std::atomic<int> count{0};
+            if (count++ < 400) std::fprintf(stderr, "[reg] %04X = %08X\n", index, value);
+        }
 
         if (index >= Reg::kScratchReg0 && index <= Reg::kScratchReg7) {
             // Registradores scratch espelhados em memoria quando habilitados em SCRATCH_UMSK.

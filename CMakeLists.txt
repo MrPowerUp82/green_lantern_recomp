@@ -107,21 +107,35 @@ set(SOURCES
     src/kernel/guest_call.cpp
     src/kernel/memory.cpp
     src/kernel/kernel_stubs.cpp
+    src/kernel/kernel_state.cpp
+    src/kernel/sync_exports.cpp
+    src/kernel/memory_exports.cpp
+    src/kernel/rtl_exports.cpp
+    src/kernel/file_exports.cpp
+    src/kernel/xam_exports.cpp
+    src/kernel/xex_exports.cpp
+    src/kernel/audio_exports.cpp
     src/kernel/import_stubs.cpp
     src/platform/filesystem.cpp
+    src/platform/crash_handler.cpp
 )
 
 add_executable(GreenLanternRecomp ${SOURCES})
 
 target_link_libraries(GreenLanternRecomp PRIVATE GpuCore Renderer RecompiledCode plume volk)
 if (WIN32)
-    target_link_libraries(GreenLanternRecomp PRIVATE d3d12 dxgi dxguid)
+    target_link_libraries(GreenLanternRecomp PRIVATE d3d12 dxgi dxguid xinput winmm)
 endif()
 
 # Configuração de Output
 set_target_properties(GreenLanternRecomp PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
+
+# Mapa de simbolos: tools/map_lookup.py traduz os RVAs do relatorio de falhas em funcoes (sub_XXXXXXXX).
+if (MSVC)
+    target_link_options(GreenLanternRecomp PRIVATE /MAP:${CMAKE_BINARY_DIR}/bin/GreenLanternRecomp.map)
+endif()
 
 endif()
 

@@ -29,9 +29,19 @@ namespace Gpu {
     // As leituras e escritas sao volatile: o guest e outras threads modificam a mesma memoria.
     class GuestMemory {
     public:
-        explicit GuestMemory(uint8_t* base = nullptr) : m_base(base) {}
+        // physicalAlias: enderecos < 0x20000000 sao fisicos (RAM do console) e espelham a faixa fisica
+        // virtual 0xA0000000+, onde o kernel aloca a memoria "fisica" (MmAllocatePhysicalMemoryEx). O jogo
+        // entrega a GPU enderecos fisicos (virt & 0x1FFFFFFF); o selftest usa enderecos baixos crus.
+        explicit GuestMemory(uint8_t* base = nullptr, bool physicalAlias = false)
+            : m_base(base), m_alias(physicalAlias) {}
 
         uint8_t* Base() const { return m_base; }
+
+        GuestAddr Resolve(GuestAddr addr) const {
+            return (m_alias && addr < 0x20000000u) ? addr + 0xA0000000u : addr;
+        }
+        // Ponteiro host para um endereco de GPU (aplica o espelho fisico).
+        uint8_t* Ptr(GuestAddr addr) const { return m_base + Resolve(addr); }
 
         // Endereco nao nulo e dentro do espaco de 4 GB.
         static bool Valid(GuestAddr addr, uint64_t sizeBytes) {
@@ -43,20 +53,22 @@ namespace Gpu {
         bool IsReadable(GuestAddr addr, uint64_t sizeBytes) const;
 
         uint32_t LoadRaw32(GuestAddr addr) const {
-            return *reinterpret_cast<const volatile uint32_t*>(m_base + addr);
+            return *reinterpret_cast<const volatile uint32_t*>(Ptr(addr));
         }
         void StoreRaw32(GuestAddr addr, uint32_t value) const {
-            *reinterpret_cast<volatile uint32_t*>(m_base + addr) = value;
+            *reinterpret_cast<volatile uint32_t*>(Ptr(addr)) = value;
         }
         uint32_t LoadBe32(GuestAddr addr) const { return ::Endian::Swap32(LoadRaw32(addr)); }
         void StoreBe32(GuestAddr addr, uint32_t value) const { StoreRaw32(addr, ::Endian::Swap32(value)); }
 
         void StoreBe16(GuestAddr addr, uint16_t value) const {
-            m_base[addr] = uint8_t(value >> 8);
-            m_base[addr + 1] = uint8_t(value);
+            uint8_t* p = Ptr(addr);
+            p[0] = uint8_t(value >> 8);
+            p[1] = uint8_t(value);
         }
 
     private:
         uint8_t* m_base;
+        bool m_alias = false;
     };
 }

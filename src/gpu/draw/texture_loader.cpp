@@ -477,7 +477,7 @@ namespace Gpu::Draw {
                             const uint32_t wordCount = (skip + guestBlockBytes + 3) / 4;
                             for (uint32_t w = 0; w < wordCount; ++w) {
                                 uint32_t raw;
-                                std::memcpy(&raw, memory.Base() + wordStart + w * 4, 4);
+                                std::memcpy(&raw, memory.Ptr(wordStart + w * 4), 4);
                                 raw = xenos::GpuSwap(raw, desc.endian);
                                 std::memcpy(words + w * 4, &raw, 4);
                             }
@@ -539,10 +539,10 @@ namespace Gpu::Draw {
         if (!desc.valid) return 0;
         uint64_t h = 0;
         if (desc.baseAddress && memory.IsReadable(desc.baseAddress, desc.baseExtentBytes)) {
-            h = HashBytes(memory.Base() + desc.baseAddress, desc.baseExtentBytes, h);
+            h = HashBytes(memory.Ptr(desc.baseAddress), desc.baseExtentBytes, h);
         }
         if (desc.mipAddress && desc.mipExtentBytes && memory.IsReadable(desc.mipAddress, desc.mipExtentBytes)) {
-            h = HashBytes(memory.Base() + desc.mipAddress, desc.mipExtentBytes, h);
+            h = HashBytes(memory.Ptr(desc.mipAddress), desc.mipExtentBytes, h);
         }
         return h;
     }

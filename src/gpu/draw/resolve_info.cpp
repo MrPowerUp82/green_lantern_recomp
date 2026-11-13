@@ -35,7 +35,7 @@ namespace Gpu::Draw {
         int32_t v[6];
         for (int i = 0; i < 6; ++i) {
             uint32_t raw;
-            std::memcpy(&raw, memory.Base() + vertices + i * 4, 4);
+            std::memcpy(&raw, memory.Ptr(vertices + i * 4), 4);
             v[i] = ToFixed16p8(std::bit_cast<float>(xenos::GpuSwap(raw, fetch.endian)) + halfPixel);
         }
         int32_t x0 = (std::min({ v[0], v[2], v[4] }) + 127) >> 8;

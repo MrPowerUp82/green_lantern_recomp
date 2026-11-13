@@ -34,7 +34,7 @@ namespace Gpu {
             return false;
         }
 
-        m_memory = GuestMemory(config.base);
+        m_memory = GuestMemory(config.base, config.physicalAlias);
         m_allocate = config.allocate;
         gpuIdentifierAddress = 0;
 
@@ -44,7 +44,7 @@ namespace Gpu {
 
         m_interrupts = std::make_unique<InterruptDispatcher>(config.caller);
         m_interrupts->SetEnabled(config.enableInterrupts);
-        m_cp = std::make_unique<CommandProcessor>(config.base, config.backend, m_interrupts.get());
+        m_cp = std::make_unique<CommandProcessor>(config.base, config.backend, m_interrupts.get(), config.physicalAlias);
 
         m_started = false;
         m_initialized = true;

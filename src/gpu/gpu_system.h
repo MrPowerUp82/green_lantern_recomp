@@ -16,6 +16,7 @@ namespace Gpu {
         std::function<GuestAddr(uint32_t)> allocate;      // aloca memoria do guest (VdPersistDisplay etc.)
         GuestCaller caller;                               // executa callbacks guest (interrupcoes)
         bool enableInterrupts = true;
+        bool physicalAlias = false;                       // enderecos < 0x20000000 sao fisicos (ver GuestMemory)
     };
 
     // Estado global da GPU emulada: os imports Vd* sao PPC_FUNC livres, entao acessam isto via Get().
