@@ -97,14 +97,18 @@ namespace Gpu {
     }
 
     void CommandProcessor::WorkerMain() {
-        uint32_t idle = 0;
+        // O guest avisa novos comandos so escrevendo o WPTR (memoria comum aqui, sem trap). O D3D
+        // sincroniza com a GPU por fences em rajadas (kick + espera), entao a latencia de cada kick
+        // importa: gira com yield ate 2 ms depois do ultimo trabalho e so entao dorme (~1 ms com
+        // timeBeginPeriod(1)). Dormir logo deixava cada ida e volta em ~10-15 ms.
+        using Clock = std::chrono::steady_clock;
+        auto lastWork = Clock::now();
         while (!m_stop.load()) {
             if (PumpOnce()) {
-                idle = 0;
+                lastWork = Clock::now();
                 continue;
             }
-            // Sem comandos: spin curto, depois espera de ~100 us para nao ocupar um nucleo.
-            if (++idle < 200) {
+            if (Clock::now() - lastWork < std::chrono::milliseconds(2)) {
                 std::this_thread::yield();
             } else {
                 std::this_thread::sleep_for(std::chrono::microseconds(100));

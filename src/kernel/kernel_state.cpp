@@ -9,6 +9,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <map>
+#include <string>
 
 #if defined(_WIN32)
 #include <windows.h>
@@ -58,11 +60,29 @@ namespace Kernel {
     void NotifyStateChanged() { g_cv.notify_all(); }
 
     // --- Dispatcher headers -----------------------------------------------------------------
+    // Como o Xenia: o wait_list (+8/+C) de um header que o HLE conhece recebe uma assinatura. O guest
+    // reinicializa eventos inline (KeInitializeEvent do XDK escreve o header direto, com wait_list
+    // apontando para si mesmo); se a assinatura sumiu, o objeto em cache e de uma vida anterior daquela
+    // memoria e e recriado a partir do header atual. Sem isso, um evento sinalizado de um objeto ja
+    // destruido "vazava" para o novo objeto alocado no mesmo endereco.
+    namespace {
+        constexpr uint32_t kHeaderSignature = 0x58454E20;  // 'XEN '
+
+        void StampHeader(uint8_t* base, uint32_t ptr) {
+            StoreBe32(base, ptr + 8, kHeaderSignature);
+            StoreBe32(base, ptr + 12, kHeaderSignature);
+        }
+
+        bool HeaderStamped(uint8_t* base, uint32_t ptr) {
+            return LoadBe32(base, ptr + 8) == kHeaderSignature && LoadBe32(base, ptr + 12) == kHeaderSignature;
+        }
+    }
 
     void KEvent::SyncGuestHeader(uint8_t* base) {
         if (!guestPtr || !base) return;
         base[guestPtr] = manual ? kTypeNotificationEvent : kTypeSynchronizationEvent;
         StoreBe32(base, guestPtr + 4, signaled ? 1 : 0);
+        StampHeader(base, guestPtr);
     }
 
     void KSemaphore::SyncGuestHeader(uint8_t* base) {
@@ -70,12 +90,14 @@ namespace Kernel {
         base[guestPtr] = kTypeSemaphore;
         StoreBe32(base, guestPtr + 4, static_cast<uint32_t>(count));
         StoreBe32(base, guestPtr + 0x10, static_cast<uint32_t>(limit));
+        StampHeader(base, guestPtr);
     }
 
     void KThread::SyncGuestHeader(uint8_t* base) {
         if (!guestPtr || !base) return;
         base[guestPtr] = kTypeThread;
         StoreBe32(base, guestPtr + 4, terminated ? 1 : 0);
+        StampHeader(base, guestPtr);
     }
 
     // --- Handles ----------------------------------------------------------------------------
@@ -107,7 +129,15 @@ namespace Kernel {
         if (ptr < 0x10000 || !base) return nullptr;  // ponteiro invalido (pagina nula)
         std::lock_guard<std::mutex> lock(g_lock);
         auto it = g_guestObjects.find(ptr);
-        if (it != g_guestObjects.end()) return it->second;
+        if (it != g_guestObjects.end()) {
+            // Header ainda e o nosso: mesmo objeto. Threads (KTHREAD do HLE) e mutantes nao sao recriados.
+            const KObject::Type cachedType = it->second->type;
+            if (HeaderStamped(base, ptr) || cachedType == KObject::Type::Thread || cachedType == KObject::Type::Mutant) {
+                return it->second;
+            }
+            // O guest reinicializou essa memoria: descarta o objeto antigo (quem ja o tem continua valido).
+            g_guestObjects.erase(it);
+        }
 
         std::shared_ptr<KObject> object;
         const uint8_t type = base[ptr];
@@ -132,6 +162,7 @@ namespace Kernel {
         }
         object->guestPtr = ptr;
         g_guestObjects[ptr] = object;
+        StampHeader(base, ptr);
         return object;
     }
 
@@ -211,7 +242,29 @@ namespace Kernel {
                 } else {
                     for (const auto& object : objects) if (object->Signaled(tid)) { ready = true; break; }
                 }
-                if (!ready) return Status::kTimeout;
+                if (!ready) {
+                    // GL_TRACE_TIMEOUTS: agrega esperas que expiram (thread, prazo, tipo e header do 1o
+                    // objeto) e imprime um resumo a cada 10 s. Mostra quem avanca so por timeout.
+                    static const bool traceTimeouts = std::getenv("GL_TRACE_TIMEOUTS") != nullptr;
+                    if (traceTimeouts) {
+                        static std::map<std::string, uint32_t> counts;
+                        static Clock::time_point lastReport = Clock::now();
+                        char key[96];
+                        const int64_t ms = *timeout100ns < 0 ? -*timeout100ns / 10000 : *timeout100ns == 0 ? 0 : -1;
+                        std::snprintf(key, sizeof(key), "t%u prazo=%lldms tipo=%d obj=%08X n=%zu", tid, static_cast<long long>(ms),
+                                      static_cast<int>(objects[0]->type), objects[0]->guestPtr, objects.size());
+                        ++counts[key];
+                        if (Clock::now() - lastReport > std::chrono::seconds(10)) {
+                            lastReport = Clock::now();
+                            std::fprintf(stderr, "[timeouts] ----\n");
+                            for (const auto& [k, v] : counts) {
+                                if (v >= 3) std::fprintf(stderr, "[timeouts] %6u x %s\n", v, k.c_str());
+                            }
+                            counts.clear();
+                        }
+                    }
+                    return Status::kTimeout;
+                }
             }
         }
     }

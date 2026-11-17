@@ -11,6 +11,8 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <iostream>
@@ -206,8 +208,11 @@ namespace {
                       uint32_t disposition, uint32_t options) {
         const std::string guestName = ObjectName(base, attributesPtr);
         const fs::path path = ResolveGuestPath(guestName);
-        if (g_traceKernel) {
-            std::fprintf(stderr, "[trace]   open '%s' -> '%s' existe=%d\n", guestName.c_str(), path.string().c_str(),
+        static const bool traceFiles = std::getenv("GL_TRACE_FILES") != nullptr;
+        if (g_traceKernel || traceFiles) {
+            static const auto start = std::chrono::steady_clock::now();
+            const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+            std::fprintf(stderr, "[open %7.2fs] '%s' -> '%s' existe=%d\n", seconds, guestName.c_str(), path.string().c_str(),
                          path.empty() ? -1 : (fs::exists(path) ? 1 : 0));
         }
         if (path.empty()) {

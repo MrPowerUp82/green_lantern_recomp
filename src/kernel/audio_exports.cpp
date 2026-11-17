@@ -42,6 +42,7 @@ namespace {
         uint32_t argument = 0;
         int16_t frame[kFrameSamples * 2] = {};  // ultimo frame entregue (estereo)
         bool submitted = false;
+        uint64_t callbacks = 0, frames = 0;  // diagnostico (GL_TRACE_AUDIO)
     };
 
     std::atomic<bool> g_running{false};
@@ -144,9 +145,25 @@ namespace {
                     t_currentClient = -1;
 
                     std::lock_guard<std::mutex> lock(g_clientsLock);
+                    ++g_clients[c].callbacks;
                     if (g_clients[c].submitted) {
+                        ++g_clients[c].frames;
                         for (uint32_t i = 0; i < kFrameSamples * 2; i++) mix[i] += g_clients[c].frame[i];
                     }
+                }
+                // GL_TRACE_AUDIO: a cada ~5 s, callbacks chamadas e quadros entregues por cliente.
+                static const bool traceAudio = std::getenv("GL_TRACE_AUDIO") != nullptr;
+                if (traceAudio && g_framesRequested % 940 == 0) {
+                    std::lock_guard<std::mutex> lock(g_clientsLock);
+                    std::fprintf(stderr, "[audio] quadro %llu:", static_cast<unsigned long long>(g_framesRequested));
+                    for (uint32_t c = 0; c < kMaxClients; c++) {
+                        if (g_clients[c].active) {
+                            std::fprintf(stderr, " cliente%u(cb=%08X) chamadas=%llu entregues=%llu", c, g_clients[c].callback,
+                                         static_cast<unsigned long long>(g_clients[c].callbacks),
+                                         static_cast<unsigned long long>(g_clients[c].frames));
+                        }
+                    }
+                    std::fprintf(stderr, "\n");
                 }
                 for (uint32_t i = 0; i < kFrameSamples * 2; i++) {
                     pcm[nextBuffer][i] = static_cast<int16_t>(mix[i] > 32767 ? 32767 : (mix[i] < -32768 ? -32768 : mix[i]));
@@ -196,7 +213,9 @@ KERNEL_FUNC(__imp__XAudioRegisterRenderDriverClient) {
     }
     if (index == kMaxClients) { ctx.r3.u64 = 0x80070005; return; }
     if (ctx.r4.u32) Endian::WriteBe32(base + ctx.r4.u32, kDriverBase | index);
-    if (g_traceKernel) std::fprintf(stderr, "[trace]   cliente de audio %u: callback=%08X arg=%08X\n", index, g_clients[index].callback, g_clients[index].argument);
+    if (g_traceKernel || std::getenv("GL_TRACE_AUDIO")) {
+        std::fprintf(stderr, "[audio] cliente %u registrado: callback=%08X arg=%08X\n", index, g_clients[index].callback, g_clients[index].argument);
+    }
 #if defined(_WIN32)
     if (!g_running.exchange(true)) g_thread = std::thread(AudioThread, base);
 #endif
@@ -270,30 +289,31 @@ namespace {
     }
     GuestAddr XmaPhysical(uint32_t address) { return address < 0x20000000 ? address + 0xA0000000 : address; }
 
-    // Um quadro XMA (512 amostras por canal, ~10,7 ms a 48 kHz) de silencio por contexto ativo.
-    void XmaStep(uint8_t* base, GuestAddr context) {
+    // Um quadro XMA (512 amostras por canal) de silencio. Devolve false se nao houve progresso (sem
+    // saida, sem entrada ou anel de saida cheio).
+    bool XmaStep(uint8_t* base, GuestAddr context) {
         uint8_t* p = base + context;
         uint32_t dw0 = Endian::ReadBe32(p + 0), dw1 = Endian::ReadBe32(p + 4), dw2 = Endian::ReadBe32(p + 8);
         uint32_t dw4 = Endian::ReadBe32(p + 16);
         const uint32_t dw9 = Endian::ReadBe32(p + 36);
-        if (!XmaField(dw1, 31, 1)) return;  // sem buffer de saida
+        if (!XmaField(dw1, 31, 1)) return false;  // sem buffer de saida
         uint32_t current = XmaField(dw4, 31, 1);
         const bool valid[2] = { XmaField(dw0, 20, 1) != 0, XmaField(dw0, 21, 1) != 0 };
         if (!valid[current]) {
-            if (!valid[current ^ 1]) return;  // nada para decodificar
+            if (!valid[current ^ 1]) return false;  // nada para decodificar
             current ^= 1;
             dw2 = XmaSetField(dw2, 0, 26, kXmaBitsPerHeader);
         }
 
         // Espaco livre no anel de saida (blocos de 256 bytes), deixando um bloco para nao confundir cheio/vazio.
         const uint32_t blocks = XmaField(dw0, 22, 5);
-        if (!blocks) return;
+        if (!blocks) return false;
         uint32_t write = XmaField(dw0, 27, 5) % blocks;
         const uint32_t read = XmaField(dw9, 0, 5) % blocks;
         const uint32_t used = (write + blocks - read) % blocks;
         const uint32_t free = blocks - 1 - used;
         const uint32_t frameBlocks = (XmaField(dw1, 29, 1) ? 2048u : 1024u) / kXmaBytesPerBlock;
-        if (free < frameBlocks) return;
+        if (free < frameBlocks) return false;
 
         const GuestAddr output = XmaPhysical(Endian::ReadBe32(p + 28));
         for (uint32_t i = 0; i < frameBlocks; ++i) {
@@ -319,17 +339,23 @@ namespace {
         Endian::WriteBe32(p + 0, dw0);
         Endian::WriteBe32(p + 8, dw2);
         Endian::WriteBe32(p + 16, dw4);
+        return true;
     }
 
+    // Como o hardware, decodifica mais rapido que o tempo real: cada passada enche o anel de saida de cada
+    // contexto (ou esgota a entrada). Streams tocados em tempo real ficam no ritmo de quem consome a saida;
+    // bancos de som decodificados no carregamento terminam logo (antes, 1 quadro a cada 10 ms deixava o
+    // loading tao longo quanto a duracao de todo o audio).
     void XmaThread(uint8_t* base) {
         for (;;) {
             {
                 std::lock_guard<std::mutex> lock(g_xmaLock);
                 for (uint32_t i = 0; i < kXmaContextCount; ++i) {
-                    if (g_xmaUsed[i]) XmaStep(base, g_xmaContexts + i * kXmaContextSize);
+                    if (!g_xmaUsed[i]) continue;
+                    for (int frame = 0; frame < 64 && XmaStep(base, g_xmaContexts + i * kXmaContextSize); ++frame) {}
                 }
             }
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
     }
 }

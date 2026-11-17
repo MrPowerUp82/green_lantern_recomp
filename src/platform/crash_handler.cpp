@@ -247,6 +247,35 @@ namespace Platform {
                         }
                         ResumeThread(t.handle);
                     }
+                    // GL_PEEK=<hex>[,<hex>...]: mostra 8 dwords em cada endereco; "*<hex>" segue o ponteiro
+                    // guardado no endereco antes de mostrar.
+                    if (const char* peek = std::getenv("GL_PEEK")) {
+                        auto committed = [](uint32_t addr) {
+                            MEMORY_BASIC_INFORMATION mbi{};
+                            return addr >= 0x10000 && VirtualQuery(g_guestBase + addr, &mbi, sizeof(mbi)) && mbi.State == MEM_COMMIT;
+                        };
+                        for (const char* p = peek; *p;) {
+                            const bool deref = *p == '*';
+                            if (deref) ++p;
+                            char* end = nullptr;
+                            uint32_t addr = static_cast<uint32_t>(std::strtoul(p, &end, 16));
+                            if (end == p) break;
+                            p = (*end == ',') ? end + 1 : end;
+                            if (deref) {
+                                if (!committed(addr)) continue;
+                                const uint32_t target = GuestLoad(addr);
+                                std::fprintf(stderr, "[peek] *%08X = %08X\n", addr, target);
+                                addr = target;
+                            }
+                            if (!committed(addr) || !committed(addr + 28)) {
+                                std::fprintf(stderr, "[peek] %08X nao mapeado\n", addr);
+                                continue;
+                            }
+                            std::fprintf(stderr, "[peek] %08X:", addr);
+                            for (uint32_t i = 0; i < 8; i++) std::fprintf(stderr, " %08X", GuestLoad(addr + i * 4));
+                            std::fprintf(stderr, "\n");
+                        }
+                    }
                     std::fflush(stderr);
                 }
             }).detach();

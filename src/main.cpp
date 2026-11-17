@@ -15,7 +15,17 @@
 #include "graphics/renderer.h"
 #include "gpu/gpu_system.h"
 
+#if defined(_WIN32)
+#include <windows.h>
+#include <timeapi.h>
+#endif
+
 int main(int argc, char** argv) {
+#if defined(_WIN32)
+    // Timer de 1 ms: sem isso os sleeps (CP da GPU, KeDelayExecutionThread, esperas com timeout) arredondam
+    // para ~15,6 ms e cada sincronizacao CPU/GPU do D3D fica ~10x mais lenta.
+    timeBeginPeriod(1);
+#endif
     // --no-gpu-interrupts: nao dispara o callback guest de vblank/INTERRUPT da GPU.
     bool gpuInterrupts = true;
     for (int i = 1; i < argc; i++) {

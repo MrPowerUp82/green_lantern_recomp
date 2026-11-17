@@ -11,7 +11,11 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 #include <iostream>
+#include <map>
+#include <mutex>
+#include <string>
 #include <thread>
 
 #if defined(_WIN32)
@@ -219,6 +223,26 @@ KERNEL_FUNC(__imp__KeWaitForMultipleObjects) {
 KERNEL_FUNC(__imp__KeDelayExecutionThread) {
     int64_t storage = 0;
     const int64_t* interval = TimeoutArg(base, ctx.r5.u32, storage);
+    // GL_TRACE_TIMEOUTS: tambem agrega os sleeps (thread, prazo, chamador) com resumo a cada 10 s.
+    static const bool traceSleeps = std::getenv("GL_TRACE_TIMEOUTS") != nullptr;
+    if (traceSleeps && interval) {
+        static std::mutex lock;
+        static std::map<std::string, uint32_t> counts;
+        static auto lastReport = std::chrono::steady_clock::now();
+        char key[80];
+        std::snprintf(key, sizeof(key), "t%u sleep=%lldms lr=%08X", CurrentThread().id,
+                      static_cast<long long>(*interval < 0 ? -*interval / 10000 : -1), static_cast<uint32_t>(ctx.lr));
+        std::lock_guard<std::mutex> guard(lock);
+        ++counts[key];
+        if (std::chrono::steady_clock::now() - lastReport > std::chrono::seconds(10)) {
+            lastReport = std::chrono::steady_clock::now();
+            std::fprintf(stderr, "[sleeps] ----\n");
+            for (const auto& [k, v] : counts) {
+                if (v >= 3) std::fprintf(stderr, "[sleeps] %6u x %s\n", v, k.c_str());
+            }
+            counts.clear();
+        }
+    }
     if (interval) SleepFor100ns(*interval);
     ctx.r3.u64 = Status::kSuccess;
 }
